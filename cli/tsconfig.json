@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": [
+      "ES2023"
+    ],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitOverride": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": "..",
+    "types": [
+      "node"
+    ],
+    "esModuleInterop": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "../cbx/src/shared/types.ts",
+    "../cbx/src/core/rules.ts",
+    "../cbx/src/core/worktree.ts",
+    "../cbx/src/core/cbx.ts",
+    "../cbx/src/core/upload.ts",
+    "../cbx/src/core/download.ts",
+    "../cbx/src/core/credentials.ts"
+  ]
+}

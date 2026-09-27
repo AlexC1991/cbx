@@ -1,0 +1,66 @@
+{
+  "name": "@coderook/cli",
+  "version": "0.32.1",
+  "description": "The command line for CodeRook (coderook.com): version control and project hosting for projects of any size. Every save is a compressed snapshot, private or public, never used to train AI.",
+  "license": "Apache-2.0",
+  "homepage": "https://coderook.com",
+  "bugs": {
+    "url": "https://github.com/AlexC1991/cbx/issues"
+  },
+  "keywords": [
+    "coderook",
+    "cbx",
+    "version-control",
+    "vcs",
+    "versioning",
+    "project-hosting",
+    "backup",
+    "snapshots",
+    "large-files",
+    "gamedev"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "bin": {
+    "cbx": "dist/cli/src/cli.js",
+    "coderook": "dist/cli/src/cli.js",
+    "git-remote-coderook": "dist/cli/src/git_remote_bin.js"
+  },
+  "files": [
+    ".claude-plugin",
+    "dist",
+    "skills",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-cbx-licence.mjs",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test --experimental-strip-types test/*.test.ts",
+    "start": "node dist/cli/src/cli.js",
+    "prepublishOnly": "npm run sync:plugin && npm run build",
+    "test:e2e": "node test/e2e.mjs",
+    "test:matrix": "node test/state-matrix.mjs",
+    "test:attempt": "node test/attempt-identity.mjs",
+    "test:get": "node test/get-safety.mjs",
+    "test:live": "node test/e2e.mjs --allow-production && node test/state-matrix.mjs --allow-production && node test/get-safety.mjs --allow-production && node test/get-track.mjs --allow-production && node test/get-protects-edits.mjs --allow-production && node test/upgrade-migration.mjs --allow-production && node test/fault-get.mjs --allow-production && node test/version-floor.mjs --allow-production && node test/fault-submit.mjs --allow-production && node test/race-attempts.mjs --allow-production && node test/attempt-identity.mjs --allow-production",
+    "test:getedits": "node test/get-protects-edits.mjs",
+    "test:upgrade": "node test/upgrade-migration.mjs",
+    "test:faultget": "node test/fault-get.mjs",
+    "test:floor": "node test/version-floor.mjs",
+    "test:faultsubmit": "node test/fault-submit.mjs",
+    "test:race": "node test/race-attempts.mjs",
+    "test:runner": "node test/runner-live.mjs",
+    "sync:plugin": "node scripts/sync-plugin-version.mjs",
+    "test:track": "node test/get-track.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlexC1991/cbx.git",
+    "directory": "cli"
+  }
+}

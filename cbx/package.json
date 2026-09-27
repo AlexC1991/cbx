@@ -1,0 +1,67 @@
+{
+  "name": "@coderook/cbx",
+  "version": "0.1.0",
+  "description": "CBX: version control for projects of any size. Snapshots, content-defined chunking, a local history with merges, and sync with CodeRook.",
+  "license": "Apache-2.0",
+  "author": "ACCA Gaming Productions",
+  "homepage": "https://github.com/AlexC1991/cbx",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlexC1991/cbx.git",
+    "directory": "cbx"
+  },
+  "bugs": {
+    "url": "https://github.com/AlexC1991/cbx/issues"
+  },
+  "keywords": [
+    "version-control",
+    "vcs",
+    "snapshots",
+    "chunking",
+    "content-defined-chunking",
+    "game-development",
+    "large-files",
+    "coderook"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "main": "dist/local/history.js",
+  "types": "dist/local/history.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/local/history.d.ts",
+      "default": "./dist/local/history.js"
+    },
+    "./local/*": {
+      "types": "./dist/local/*.d.ts",
+      "default": "./dist/local/*.js"
+    },
+    "./core/*": {
+      "types": "./dist/core/*.d.ts",
+      "default": "./dist/core/*.js"
+    },
+    "./shared/*": {
+      "types": "./dist/shared/*.d.ts",
+      "default": "./dist/shared/*.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "spec",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test --experimental-strip-types test/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}
