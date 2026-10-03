@@ -2,7 +2,7 @@
   "name": "coderook",
   "displayName": "CodeRook",
   "description": "Save, browse and restore whole-snapshot versions of a project on CodeRook, from Claude Code.",
-  "version": "0.33.0",
+  "version": "0.33.1",
   "author": {
     "name": "ACCA Gaming Productions",
     "url": "https://coderook.com"

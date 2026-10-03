@@ -1,6 +1,6 @@
 {
   "name": "@coderook/cli",
-  "version": "0.33.0",
+  "version": "0.33.1",
   "description": "The command line for CodeRook (coderook.com): version control and project hosting for projects of any size. Every save is a compressed snapshot, private or public, never used to train AI.",
   "license": "Apache-2.0",
   "homepage": "https://coderook.com",

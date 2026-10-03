@@ -97,7 +97,7 @@ import {
 } from "./version_commands.js";
 import { declareClient } from "../../cbx/src/core/identify.js";
 import { commandDiff } from "./diff_command.js";
-import { describeError, tuneNetwork } from "./network.js";
+import { describeError, pause, tuneNetwork } from "./network.js";
 import {
   commandInit,
   commandRestore,
@@ -1173,7 +1173,7 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
   }
 
   const line = progressLine();
-  const uploader = new Uploader(credentials);
+  let uploader = new Uploader(credentials);
   /*
     Built by the shared description, so this and the git remote helper cannot
     drift. They already had: the helper listed deletions in `deletions` alone
@@ -1287,6 +1287,18 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
   }
 
   let result;
+  /*
+    How long to wait before picking a dropped upload up again by itself.
+
+    Each request is already retried for a few seconds, but a Wi-Fi drop or a
+    router reconnecting outlasts that, and the upload ended with "run the same
+    command again" for somebody to notice and act on. Running it again was
+    always safe and cheap (pieces already stored are recognised and skipped,
+    and the save itself is named so it can never be made twice), so the
+    command now does it itself, a few times, before giving up.
+  */
+  const resumeAfter = [10, 30, 60];
+  for (let resumed = 0; ; resumed += 1) {
   try {
     const plan = await uploader.plan(
       uploadRequest,
@@ -1340,6 +1352,7 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
         );
       },
     );
+    break;
   } catch (error) {
     done(line);
     /*
@@ -1350,6 +1363,24 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
     */
     const failure = classifyPublishFailure(error);
     const text = describeError(error);
+    if (failure?.kind === "interrupted" && !dryRun && resumed < resumeAfter.length) {
+      const wait = resumeAfter[resumed]!;
+      console.error(dim(`The connection dropped (${text})`));
+      console.error(
+        dim(
+          `Picking the upload up again in ${wait}s (try ${resumed + 2} of ${resumeAfter.length + 1}).` +
+            ` Pieces already sent are kept; only the rest goes.`,
+        ),
+      );
+      /*
+        The failed attempt's other lanes are still retrying; stopped first, so
+        they do not carry on sending beside the attempt that replaces them.
+      */
+      uploader.cancel();
+      await pause(wait * 1000);
+      uploader = new Uploader(credentials);
+      continue;
+    }
     if (failure?.kind === "interrupted") {
       console.error(red(`
 The connection failed: ${text}`));
@@ -1376,6 +1407,7 @@ The connection failed: ${text}`));
       return 1;
     }
     throw error;
+  }
   }
   done(line);
 
