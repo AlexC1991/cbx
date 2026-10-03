@@ -278,6 +278,14 @@ export type UploadRequest = {
   /** The repository this project already maps to, if it has one. */
   repositoryId: string | null;
   /*
+    What a new project's name colliding with an existing one means. True (the
+    default, and what the desktop has always done) saves into the project of
+    that name. False reports the collision instead: a caller that has already
+    asked the person which project this is must not have the answer replaced
+    by a name that happens to match.
+  */
+  joinExisting?: boolean;
+  /*
     The version this workspace was working from. Sending it turns publishing
     into a compare-and-swap: if somebody else saved in the meantime, their
     work is merged in rather than laid over, and a genuine clash is reported
@@ -1169,6 +1177,12 @@ export class Uploader {
       */
       const existing = await this.findBySlug(slug);
       if (!existing) throw error;
+      if (request.joinExisting === false) {
+        throw new Error(
+          `Your account already has a project called ${slug}. Save into it on purpose, ` +
+            `or give this one another name.`,
+        );
+      }
       return existing;
     }
   }

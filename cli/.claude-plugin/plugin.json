@@ -1,8 +1,8 @@
 {
   "name": "coderook",
   "displayName": "CodeRook",
-  "description": "Save, browse and restore whole-snapshot versions of a project on CodeRook, from Claude Code.",
-  "version": "0.33.1",
+  "description": "Save, browse and restore whole-snapshot versions of a project on CodeRook, with cbx or plain git, from Claude Code.",
+  "version": "0.34.0",
   "author": {
     "name": "ACCA Gaming Productions",
     "url": "https://coderook.com"
@@ -13,6 +13,7 @@
     "coderook",
     "versioning",
     "snapshots",
-    "backup"
+    "backup",
+    "git"
   ]
 }

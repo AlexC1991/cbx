@@ -14,7 +14,7 @@ import { createInterface } from "node:readline/promises";
 import os from "node:os";
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -38,6 +38,7 @@ import { renderCommandHelp, renderHelp, renderUnknown } from "./help.js";
 import { bar } from "./progress.js";
 import { classifyPublishFailure, uploadRequestFor } from "./publish.js";
 import { commandAttach } from "./attach_command.js";
+import { commandBuild } from "./build_command.js";
 import { commandPages } from "./pages_command.js";
 import {
   commandAi,
@@ -121,7 +122,9 @@ import {
   readManifest as readBundleManifest,
   unpackBundle,
 } from "../../cbx/src/core/cbx.js";
-import { findProject, health, projectById, projects, whoami } from "./api.js";
+import { findProject, health, projectById, projects, whoami, type AccountProject } from "./api.js";
+import { similarProjects, slugFor } from "./folder_match.js";
+import { chooseProject, likenessLine } from "./project_choice.js";
 import {
   fetchSnapshot,
   gitAvailable,
@@ -310,7 +313,16 @@ const folderFor = (parsed: Parsed, index = 0): string =>
  */
 async function reconcile(
   folder: string,
-  options: { quiet?: boolean } = {},
+  options: {
+    quiet?: boolean;
+    /**
+     * The project an unlinked folder is to be linked to, chosen by the person
+     * (`--into`, `cbx link`, or the question `submit` asks).
+     */
+    adopt?: AccountProject;
+    /** False for a dry run, which links nothing. */
+    persist?: boolean;
+  } = {},
 ): Promise<{
   link: Link | null;
   baseline: Map<string, string> | null;
@@ -324,11 +336,22 @@ async function reconcile(
   member: boolean;
 }> {
   const link = await readLink(folder);
-  const reference = link?.slug ?? path.basename(folder);
+  /*
+    A folder that is not linked is not linked.
+
+    This used to look the folder's name up and link it to whatever answered,
+    from any command — `status` included, and straight after `cbx unlink`.
+    That is how an inner folder named like its parent's project was saved into
+    it, laying a second copy of the app over the project's root. Which project
+    a folder belongs to is a question for the person, asked where it matters.
+  */
+  if (!link && !options.adopt) {
+    return { link: null, baseline: null, behind: null, member: true };
+  }
   let member = true;
   let project = link
     ? (await projects()).find((candidate) => candidate.id === link.repositoryId)
-    : await findProject(reference);
+    : options.adopt;
   /*
     Not on the account's own list, which holds only projects it is in. A
     folder cloned from somebody else's public project is exactly that, and
@@ -424,9 +447,11 @@ async function reconcile(
     local: Object.fromEntries(baseline),
     manifest: Object.fromEntries(baseline),
   };
-  await writeLink(folder, fresh);
-  if (!options.quiet && !link) {
-    console.log(dim(`Linked this folder to ${project.slug}.`));
+  if (options.persist !== false) {
+    await writeLink(folder, fresh);
+    if (!options.quiet && !link) {
+      console.log(dim(`Linked this folder to ${project.slug}.`));
+    }
   }
   return { link: fresh, baseline, behind: null, member };
 }
@@ -506,8 +531,39 @@ async function commandUnlink(parsed: Parsed): Promise<number> {
   );
   console.log(
     dim(
-      "Nothing was deleted. Submitting from here now starts a new project.",
+      "Nothing was deleted. The next submit from here asks which project it is.",
     ),
+  );
+  return 0;
+}
+
+async function commandLink(parsed: Parsed): Promise<number> {
+  const reference = parsed.positional[0];
+  if (!reference) {
+    console.error(red("Say which project: cbx link <project> [folder]"));
+    return 1;
+  }
+  const folder = folderFor(parsed, 1);
+  const already = await readLink(folder);
+  if (already) {
+    console.error(red(`This folder is already linked to ${already.slug}.`));
+    console.error(dim(`  Run ${accent("cbx unlink")} first to link it somewhere else.`));
+    return 1;
+  }
+  const project = await findProject(reference);
+  if (!project) {
+    console.error(red(`No project matching "${reference}" on your account.`));
+    return 1;
+  }
+  const { link } = await reconcile(folder, { adopt: project, quiet: true });
+  if (!link) {
+    console.error(red(`${project.slug} has nothing saved yet, so there is nothing to link to.`));
+    console.error(dim(`  Save into it with ${accent(`cbx submit --into ${project.slug}`)}.`));
+    return 1;
+  }
+  console.log(`Linked ${bold(path.basename(folder))} to ${accent(project.slug)}` + dim(` at v${link.sequence}`) + ".");
+  console.log(
+    dim(`  ${accent("cbx status")} shows how this folder differs from it; nothing was sent or fetched.`),
   );
   return 0;
 }
@@ -546,8 +602,22 @@ async function commandStatus(parsed: Parsed): Promise<number> {
   console.log(
     link
       ? `Account holds ${accent(`v${link.sequence}`)} · ${Object.keys(link.manifest).length} files ${dim(`(${link.slug})`)}`
-      : dim("Not on your account yet — submitting will create it."),
+      : dim("This folder is not linked to a project."),
   );
+  if (!link) {
+    const likes = similarProjects(await projects().catch(() => []), path.basename(folder));
+    if (likes.length) {
+      const width = Math.max(...likes.map((like) => like.project.slug.length));
+      console.log(dim("Projects on your account like it:"));
+      for (const like of likes) console.log(`  ${await likenessLine(folder, like, width)}`);
+      console.log(
+        dim("Link it with ") + accent(`cbx link ${likes[0]!.project.slug}`) +
+          dim(", or start a separate project with ") + accent('cbx submit --new -m "…"') + dim("."),
+      );
+    } else {
+      console.log(dim("Submitting will create a project for it."));
+    }
+  }
 
   /*
     A folder can have nothing to send and still not hold the whole version:
@@ -780,6 +850,8 @@ async function commandImport(parsed: Parsed): Promise<number> {
     types afterwards to fetch it.
   */
   if (!submitFlags.has("name")) submitFlags.set("name", plan.name);
+  /* An import is a new project; one already called this is said, not joined. */
+  if (!submitFlags.has("into")) submitFlags.set("new", true);
   if (!submitFlags.has("m") && !submitFlags.has("message")) {
     submitFlags.set("message", `Imported from ${url}`);
   }
@@ -798,6 +870,29 @@ async function commandImport(parsed: Parsed): Promise<number> {
     );
   }
   return code;
+}
+
+/**
+ * Say so when this folder is a git repository with no CodeRook remote.
+ *
+ * Every save from one is a snapshot that forgets the commits it holds, and an
+ * assistant told only about `cbx submit` never learns there is another way:
+ * the remote helper, which saves each commit with its message. One line,
+ * after the save, and only until the remote exists.
+ */
+function noteGitRoute(folder: string, slug: string | null): void {
+  try {
+    const config = readFileSync(path.join(folder, ".git", "config"), "utf8");
+    if (/coderook:/.test(config)) return;
+  } catch {
+    return;
+  }
+  const name = slug ?? "<project>";
+  console.log(
+    dim("This is a git repository. To save each commit with its message instead of snapshots: ") +
+      accent(`git remote add coderook coderook://${name}`) + dim(" then ") +
+      accent("git push -o adopt coderook main") + dim(" once, and plain git push after."),
+  );
 }
 
 /** A file's SHA-256, streamed; null when it cannot be read. */
@@ -855,7 +950,35 @@ async function commandSubmit(parsed: Parsed): Promise<number> {
     return 1;
   }
   const dryRun = hasFlag(parsed, "dry-run", "n");
-  const { link, baseline, behind, member } = await reconcile(folder);
+  /*
+    Which project this goes into is settled before anything is scanned, and
+    by the person: a folder that is not linked is never joined to a project
+    because their names agree, nor quietly made into a second copy of one.
+  */
+  const already = await readLink(folder);
+  let adopt: AccountProject | undefined;
+  const intoFlag = flagText(parsed, "into");
+  if (already && (hasFlag(parsed, "new") || (intoFlag && slugFor(intoFlag.split("/").pop()!) !== already.slug))) {
+    console.error(red(`This folder is already linked to ${already.slug}.`));
+    console.error(dim(`  Run ${accent("cbx unlink")} first to save it somewhere else.`));
+    return 1;
+  }
+  if (!already) {
+    const chosen = await chooseProject({
+      folder,
+      name: flagText(parsed, "name") ?? path.basename(folder),
+      ...(intoFlag ? { into: intoFlag } : {}),
+      startNew: hasFlag(parsed, "new"),
+      command: "cbx submit",
+    });
+    if (!chosen) return 1;
+    if ("id" in chosen) adopt = chosen;
+    else parsed.flags.set("name", chosen.name);
+  }
+  const { link, baseline, behind, member } = await reconcile(folder, {
+    ...(adopt ? { adopt } : {}),
+    persist: !dryRun,
+  });
   /*
     Somebody else's project, cloned from its public page. Reading and
     fetching are fine; saving into it is not this account's to do, and the
@@ -890,8 +1013,8 @@ async function commandSubmit(parsed: Parsed): Promise<number> {
     what would be added instead.
   */
   const wouldLicence =
-    dryRun && !link && !hasFlag(parsed, "no-licence") && !existsSync(path.join(folder, "LICENSE"));
-  const added = link || dryRun
+    dryRun && !link && !adopt && !hasFlag(parsed, "no-licence") && !existsSync(path.join(folder, "LICENSE"));
+  const added = link || adopt || dryRun
     ? null
     : await licenceNewProject(
         folder,
@@ -1203,8 +1326,13 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
       a surprise, and the flag exists for projects that do not exist yet.
     */
     projectName:
-      link?.slug ?? flagText(parsed, "name") ?? path.basename(folder),
-    repositoryId: link?.repositoryId ?? null,
+      link?.slug ?? adopt?.slug ?? flagText(parsed, "name") ?? path.basename(folder),
+    repositoryId: link?.repositoryId ?? adopt?.id ?? null,
+    /*
+      Settled above, so a project that appears under this name between the
+      question and the save is a collision to report, not one to join.
+    */
+    joinExisting: false,
     // Every current CLI publish states its ancestry. A brand-new project is
     // explicitly based on an empty Track; a linked folder names the immutable
     // Version it was last reconciled with.
@@ -1532,6 +1660,7 @@ The connection failed: ${text}`));
       ` · the save holds ${bytes(result.sourceBytes)}`,
   );
   noteKeptDeletions(folder, baseline, hasFlag(parsed, "sync"));
+  noteGitRoute(folder, link?.slug ?? adopt?.slug ?? slugFor(flagText(parsed, "name") ?? path.basename(folder)));
   /*
     Where the time went, when asked for.
 
@@ -1567,6 +1696,10 @@ async function commandGet(parsed: Parsed): Promise<number> {
   const { link } = await reconcile(folder);
   if (!link) {
     console.error(red("This folder is not linked to a project on your account."));
+    console.error(
+      dim("  Link it with ") + accent("cbx link <project>") +
+        dim(", or fetch a project into a new folder with ") + accent("cbx clone <project>") + dim("."),
+    );
     return 1;
   }
 
@@ -2614,7 +2747,10 @@ const SPECS: CommandSpec[] = [
     detail:
       "Sends everything that changed since the last save. If the folder is\n" +
       "not linked to a project yet, one is created on your account, named\n" +
-      "after the folder and private to begin with.\n\n" +
+      "after the folder and private to begin with — unless your account\n" +
+      "already has a project with a name like it. Then you are asked which\n" +
+      "you mean, and a script or assistant must say: --into <project> saves\n" +
+      "into it, --new starts a separate one.\n\n" +
       "A save is not a version. Nobody outside the project can see one until\n" +
       "it is named, which is what `cbx release` does — so submitting is as\n" +
       "cheap and as private as you want it to be.",
@@ -2624,6 +2760,14 @@ const SPECS: CommandSpec[] = [
       {
         flags: "--name <name>",
         description: "name a new project this, instead of after the folder",
+      },
+      {
+        flags: "--into <project>",
+        description: "first save from this folder: save into this project and link the folder to it",
+      },
+      {
+        flags: "--new",
+        description: "first save from this folder: start a new project even if one has a similar name",
       },
       {
         flags: "--allow-secrets",
@@ -2646,6 +2790,7 @@ const SPECS: CommandSpec[] = [
     ],
     examples: [
       'cbx submit -m "Fix the export dialog"',
+      'cbx submit --into voxai-coder -m "First save from the Linux machine"',
       'cbx submit --track spike -m "Try the other encoder"',
     ],
     run: commandSubmit,
@@ -2767,6 +2912,21 @@ const SPECS: CommandSpec[] = [
     ],
     examples: ["cbx switch", "cbx switch -c spike", "cbx switch main"],
     run: localFirst(localSwitch, commandTrack),
+  },
+  {
+    name: "link",
+    group: "Working with a folder",
+    summary: "connect this folder to a project already on your account",
+    usage: "link <project> [folder]",
+    detail:
+      "Says which project this folder is a copy of, without sending or\n" +
+      "fetching anything. Use it for a folder that holds a project you saved\n" +
+      "from somewhere else — another machine, another operating system, or a\n" +
+      "copy made by hand — so its next save goes into that project instead\n" +
+      "of starting a new one. Files that differ here are what the next save\n" +
+      "sends; `cbx status` shows them first.",
+    examples: ["cbx link voxai-coder", "cbx link my-project ./copy"],
+    run: commandLink,
   },
   {
     name: "unlink",
@@ -3724,6 +3884,36 @@ function localTwin(
     run: localFirst(local, spec.run),
   };
 }
+
+SPECS.push({
+  name: "build",
+  group: "Actions",
+  summary: "build executables for Windows, Linux and macOS on this machine",
+  usage: "build [folder] [--target win,linux,mac]",
+  detail:
+    "Builds the project in this folder for each target, using whatever this\n" +
+    "machine has: Go, Bun, Deno and .NET build every platform from any one;\n" +
+    "Rust does with cargo-zigbuild; Electron builds Windows and Linux in\n" +
+    "Docker; PyInstaller builds Linux in Docker or WSL. A target this machine\n" +
+    "cannot build is named, with what would build it. Nothing is uploaded\n" +
+    "unless --ship is given. Output goes to .coderook/build/<target>/.\n\n" +
+    "The toolchain is recognised from the files here. To fix it, or to give\n" +
+    "a command of your own, describe the build in coderook.build.json\n" +
+    "(cbx build init writes one), which is saved with the project.",
+  options: [
+    { flags: "-t, --target <list>", description: "windows-x64, linux-arm64, macos-arm64 … or win, linux, mac, all" },
+    { flags: "--plan", description: "say how each target would be built, build nothing" },
+    { flags: "--preset <name>", description: "go, bun, deno, rust, dotnet, electron, pyinstaller or custom" },
+    { flags: "--ship", description: "attach what was built to the project's newest save" },
+  ],
+  examples: [
+    "cbx build --plan",
+    "cbx build --target win,linux,mac",
+    "cbx build --target all --ship",
+    "cbx build init",
+  ],
+  run: commandBuild,
+});
 
 SPECS.push(
   localTwin(

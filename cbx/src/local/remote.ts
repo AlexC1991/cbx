@@ -167,6 +167,8 @@ export async function push(
     credentials: Credentials;
     /** Names the project when this push creates it. */
     projectName: string;
+    /** False: a project already called `projectName` is reported, not joined. */
+    joinExisting?: boolean;
     /** Used when this history has never pushed: the project the folder is linked to. */
     repositoryId?: string | null;
     allowSecrets?: boolean;
@@ -284,6 +286,7 @@ export async function push(
           message: shortMessage(save.message),
           projectName: options.projectName,
           repositoryId,
+          ...(options.joinExisting === false ? { joinExisting: false } : {}),
           baseVersionId,
           ...(baseVersionId ? { expectedHeadVersionId: baseVersionId } : {}),
           track: line,

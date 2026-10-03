@@ -80,9 +80,20 @@ cbx clone my-project          fetch a project into a new folder
 ```
 
 `status` and `submit` act on the current directory unless you name another.
-The first time either runs in a folder, it looks for a project on your account
-whose name matches and links the two, so a folder you already uploaded from
-the desktop is recognised rather than treated as new.
+
+A folder is linked to its project by its first save, by `cbx clone`, or by
+`cbx link <project>`, and the link travels with the folder (in
+`.coderook/link.json`), so the same disk seen from another operating system is
+still recognised. A folder that is not linked is never matched to a project by
+name. Its first `submit` starts a new project, unless your account already has
+one with a name like it; then you are asked which you mean. A script or an
+assistant has to say:
+
+```
+cbx submit --into my-project -m "…"    this folder is that project
+cbx submit --new -m "…"                a separate project
+cbx link my-project                    link it now, send nothing
+```
 
 `submit` sends only what changed. Files the service already holds are not
 uploaded again, and the version it records still names every file in the
@@ -302,14 +313,31 @@ Installing the CLI also installs `git-remote-coderook`, so git talks to
 CodeRook directly — both ways:
 
 ```
-git clone coderook://my-project
+git clone coderook://my-project                       # the remote is called origin
+git remote add coderook coderook://my-project         # or add it to a repository you have
 git push coderook main
-git fetch
+git fetch coderook
 ```
 
-It exists so that every editor's built-in git panel works with CodeRook
-without a plugin. If you are not already living in git, `cbx submit` is
-the simpler tool and this is not an upgrade on it.
+If your folder is a git repository, use this rather than `cbx submit`: each
+commit arrives with its own message, and every editor's built-in git panel
+works with CodeRook without a plugin. `cbx submit` is the tool for folders
+that are not git repositories. The helper is installed by
+`npm install --global @coderook/cli`; the Claude Code plugin and `npx` do not
+put it on your `PATH`.
+
+**A project you started with `cbx submit`.** Its saves did not come from git,
+so the first push from your repository is refused rather than replaying your
+history on top of them. If the repository holds that project, adopt it once:
+
+```
+git push -o adopt coderook main
+```
+
+The project's saves stay as they are, your current commit is saved on top as
+one save, and from then on every push sends one save per commit. Or start
+from the project instead: `git clone coderook://my-project` and carry on in
+the clone.
 
 **Pushing.** Each commit becomes a version, oldest first, with its message
 kept. Later pushes send only what is new, so the usual case — a few commits —
@@ -348,7 +376,7 @@ has two parents is rebuilt as a real git merge.
 Each version records the commit it came from, so a colleague pushing the same
 project does not republish history the project already holds. Pushing a git
 history into a project whose versions came from somewhere else is refused
-rather than interleaved.
+rather than interleaved, unless you adopt it with `-o adopt` as above.
 
 ### The names are the same
 
@@ -407,6 +435,33 @@ Assets are separate and unaffected. They attach to a version from a run's
 artifacts or with `cbx attach <file>`, so a release made by pushing a tag
 simply has none until something adds them — which is what a release without a
 build has always looked like.
+
+## Building for every platform
+
+```
+cbx build --plan                  how each target would be built on this machine
+cbx build --target win,linux,mac  build them
+cbx build --target all --ship     and attach them to the newest save
+cbx build init                    describe the build in coderook.build.json
+```
+
+`cbx build` makes the project's executables for Windows, Linux and macOS on
+the machine you are using. Each target is built natively, cross-compiled, in
+Docker or in WSL, chosen from what is installed; one that cannot be built here
+is named, with what would build it.
+
+| Toolchain | From any machine | Needs its own system |
+| --- | --- | --- |
+| Go, Bun, Deno, .NET | Windows, Linux, macOS | — |
+| Rust | all three, with cargo-zigbuild | macOS apps using system frameworks |
+| Electron | Windows and Linux, with Docker (or wine) | macOS |
+| PyInstaller | Linux, with Docker or WSL | Windows, macOS |
+
+The toolchain is recognised from the files present. `coderook.build.json`
+settles it, and takes a command of your own (`{target}`, `{os}`, `{arch}` and
+`{out}` are filled in, and a target can name a Docker image to run it in).
+Output lands in `.coderook/build/<target>/`, which is never uploaded and which
+git ignores — not `dist/`, which Electron apps commonly package.
 
 ## Bundles
 

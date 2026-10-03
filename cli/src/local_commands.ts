@@ -40,6 +40,7 @@ import {
 
 import { projectById } from "./api.js";
 import { credentials, readLink, writeLink } from "./config.js";
+import { chooseProject } from "./project_choice.js";
 import { resolveProject } from "./project_commands.js";
 import { classifyPublishFailure } from "./publish.js";
 import type { Parsed } from "./registry.js";
@@ -420,11 +421,31 @@ async function recordLink(
 export async function localPush(parsed: Parsed, repository: Repository): Promise<number> {
   return reporting(async () => {
     const link = await readLink(repository.root);
+    /*
+      A history that has never been pushed, in a folder linked to nothing,
+      is asked which project it belongs to, as `cbx submit` asks: naming it
+      after the folder joined any project that shared the name.
+    */
+    let chosen: Awaited<ReturnType<typeof chooseProject>> = null;
+    if (!link && !(await readRemote(repository)).repositoryId) {
+      const into = parsed.flags.get("into");
+      const named = parsed.flags.get("name");
+      chosen = await chooseProject({
+        folder: repository.root,
+        name: typeof named === "string" ? named : path.basename(repository.root),
+        ...(typeof into === "string" ? { into } : {}),
+        startNew: has(parsed, "new"),
+        command: "cbx push",
+      });
+      if (!chosen) return 1;
+    }
     const interactive = process.stdout.isTTY;
     const result = await push(repository, {
       credentials,
-      projectName: link?.slug ?? path.basename(repository.root),
-      repositoryId: link?.repositoryId ?? null,
+      projectName:
+        link?.slug ?? (chosen ? ("id" in chosen ? chosen.slug : chosen.name) : path.basename(repository.root)),
+      repositoryId: link?.repositoryId ?? (chosen && "id" in chosen ? chosen.id : null),
+      joinExisting: false,
       allowSecrets: has(parsed, "allow-secrets"),
       acknowledged: has(parsed, "yes", "y"),
       report: (event) => {

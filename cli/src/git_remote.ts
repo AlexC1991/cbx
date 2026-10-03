@@ -1019,6 +1019,7 @@ async function doImport(
 async function doPush(
   requests: PushRequest[],
   url: string,
+  options: { adopt?: boolean } = {},
 ): Promise<void> {
   /*
     A push never goes to the account named in the URL — it goes to the one the
@@ -1075,6 +1076,18 @@ async function doPush(
   const refreshProject = async () => {
     if (!repositoryId) repositoryId = (await findProject(slug))?.id ?? null;
     state = repositoryId ? await remoteState(repositoryId) : null;
+    /*
+      A clone knows commits the messages do not name: the ones it built when
+      it imported each version. Counted as published, so a branch started in
+      a clone forks from the version it was cloned at — and a clone of a
+      project saved with `cbx submit` is not mistaken for unrelated history.
+    */
+    if (state && marks) {
+      for (const [versionId, mark] of marks.ofVersion) {
+        const sha = marks.sha.get(mark);
+        if (sha && !state.versionOfSha.has(sha)) state.versionOfSha.set(sha, versionId);
+      }
+    }
   };
   const knownRefs = () => {
     const found = new Map<string, string>();
@@ -1263,15 +1276,43 @@ async function doPush(
         the ordinary act of pushing a second branch to a project git already
         owns, which is the common case and not a conflict of any kind.
       */
+      /*
+        Unless the person says this repository *is* that project.
+
+        The usual way here is a working repository whose CodeRook project was
+        started with `cbx submit` or the desktop app: same files, different
+        history. Refusing outright sent people to make a second project, which
+        is the duplicate this exists to prevent. `-o adopt` takes the middle
+        road: the project's saves stay as they are, this commit's tree is saved
+        on top as one save that names the commit, and from then on the project
+        and the repository agree, so later pushes add one save per commit.
+      */
+      let adopting: { headVersionId: string } | null = null;
       if (state && !already && state.versionCount > 0 && state.versionOfSha.size === 0) {
-        send(
-          `error ${request.dst} the project "${slug}" already has ${state.versionCount} version${state.versionCount === 1 ? "" : "s"} that did not come from git; pushing would publish this history a second time`,
+        const line = state.tracks.find(
+          (candidate) => candidate.name === branch && candidate.kind === "line",
         );
-        say(
-          `\n  Push to a new project instead:\n` +
-            `    git remote set-url coderook coderook://<a-new-name>\n`,
-        );
-        continue;
+        if (options.adopt && line?.headVersionId) {
+          adopting = { headVersionId: line.headVersionId };
+          say(
+            `  adopting "${slug}": its ${state.versionCount} save${state.versionCount === 1 ? "" : "s"} stay as they are;` +
+              ` ${tip.slice(0, 8)} is saved on top as one save,\n  and later pushes add one save per commit.`,
+          );
+        } else {
+          send(
+            `error ${request.dst} the project "${slug}" already has ${state.versionCount} version${state.versionCount === 1 ? "" : "s"} that did not come from git; pushing would publish this history a second time`,
+          );
+          say(
+            options.adopt
+              ? `\n  The project has no line called "${branch}" to adopt. Push the branch it saves on, usually main.\n`
+              : `\n  If this repository holds that project, save it on top and link the two:\n` +
+                  `    git push -o adopt coderook ${branch}\n` +
+                  `  Your git history is not replayed; the commit you push becomes one save,\n` +
+                  `  and every push after it sends one save per commit.\n\n` +
+                  `  Or start from the project instead: git clone coderook://${slug}\n`,
+          );
+          continue;
+        }
       }
 
       /*
@@ -1288,10 +1329,12 @@ async function doPush(
 
       const from = already ?? fork?.sha ?? null;
       const range = from ? `${from}..${tip}` : tip;
-      const commits = git(["rev-list", "--reverse", "--topo-order", range])
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
+      const commits = adopting
+        ? [tip]
+        : git(["rev-list", "--reverse", "--topo-order", range])
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean);
 
       if (!commits.length) {
         /*
@@ -1360,7 +1403,13 @@ async function doPush(
       let currentRepositoryId = repositoryId;
       let published = 0;
 
-      if (from && repositoryId && state) {
+      if (adopting && repositoryId) {
+        baseVersionId = adopting.headVersionId;
+        const { Downloader } = await import("../../cbx/src/core/download.js");
+        const held = await new Downloader(credentials).files(repositoryId, baseVersionId);
+        manifest = Object.fromEntries(held.map((file) => [file.path, file.sha256]));
+        local = { ...manifest };
+      } else if (from && repositoryId && state) {
         previous = from;
         if (already) {
           const track = state.tracks.find(
@@ -1418,6 +1467,18 @@ async function doPush(
 
         const changes = await applyCommit(catFile, scratch, previous, sha);
         previous = sha;
+        if (adopting) {
+          /*
+            The commit's tree is the whole truth: what the project holds and
+            the commit does not is removed, exactly as a later push would.
+          */
+          const inTree = new Set(
+            git(["ls-tree", "-r", "-z", "--name-only", sha]).split("\0").filter(Boolean),
+          );
+          for (const file of Object.keys(manifest)) {
+            if (!inTree.has(file) && !changes.deleted.includes(file)) changes.deleted.push(file);
+          }
+        }
         if (changes.skipped.length) {
           say(`  skipped ${changes.skipped.length} submodule path(s) in ${sha.slice(0, 8)}`);
         }
@@ -1613,6 +1674,8 @@ export async function main(argv: string[]): Promise<number> {
   let unservable = false;
   /** `git clone --depth N`, when git passed one. */
   let depth: number | null = null;
+  /** `git push -o adopt`. */
+  let adopt = false;
 
   for await (const line of lines()) {
     const command = line.trim();
@@ -1637,6 +1700,10 @@ export async function main(argv: string[]): Promise<number> {
       const [, name, value] = command.split(" ");
       if (name === "depth" && /^[1-9][0-9]*$/.test(value ?? "")) {
         depth = Number(value);
+        send("ok");
+      } else if (name === "push-option" && value === "adopt") {
+        /* `git push -o adopt`: see the adopting note in doPush. */
+        adopt = true;
         send("ok");
       } else {
         send("unsupported");
@@ -1788,7 +1855,7 @@ export async function main(argv: string[]): Promise<number> {
           send("");
           continue;
         }
-        await doPush(batch, url);
+        await doPush(batch, url, { adopt });
       }
       continue;
     }

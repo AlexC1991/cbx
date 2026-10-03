@@ -18,6 +18,7 @@
  * cost you work. Saving a version stays a thing a person types.
  */
 
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -266,8 +267,16 @@ const TOOLS: Tool[] = [
       );
       const link = await readLink(folder);
       const rules = await readRules(folder);
-      const changed = await changedFiles(folder, rules, null);
-      if (!changed.length) return "Nothing here has changed since the last version.";
+      /*
+        Measured against what the folder last held, as `cbx status` measures.
+        Passing nothing here called every file in the folder new.
+      */
+      const baseline = link?.manifest
+        ? new Map(Object.entries(link.local ?? link.manifest))
+        : null;
+      const changed = await changedFiles(folder, rules, baseline);
+      const saving = howToSave(folder, link?.slug ?? null);
+      if (!changed.length) return `Nothing here has changed since the last version.\n${saving}`;
       /*
         Said in the words the scan actually produces: a file the folder no
         longer has is a deletion, one with nothing removed is new, and the
@@ -283,10 +292,37 @@ const TOOLS: Tool[] = [
         lines.push(`… and ${changed.length - lines.length} more`);
       }
       const where = link ? `${link.slug} (v${link.sequence})` : "not linked to a project";
-      return `${folder} — ${where}\n${changed.length} changed\n${lines.join("\n")}`;
+      return `${folder} — ${where}\n${changed.length} changed\n${lines.join("\n")}\n${saving}`;
     },
   },
 ];
+
+/**
+ * Which way this folder is saved, said to the assistant reading the status.
+ *
+ * Saving stays something a person agrees to, so this names the command and
+ * runs nothing. A git repository is pointed at git: each commit then keeps its
+ * own message, where `cbx submit` would make one snapshot of all of them.
+ */
+function howToSave(folder: string, slug: string | null): string {
+  let config: string | null = null;
+  try {
+    config = readFileSync(path.join(folder, ".git", "config"), "utf8");
+  } catch {
+    /* Not a git repository. */
+  }
+  if (config !== null) {
+    const remote = config.match(/\[remote "([^"]+)"\][^[]*?url\s*=\s*coderook:/);
+    if (remote) return `To save: commit, then git push ${remote[1]} <branch> (ask first).`;
+    return (
+      `This is a git repository with no CodeRook remote. To save each commit: ` +
+      `git remote add coderook coderook://${slug ?? "<project>"}, then git push coderook <branch> ` +
+      `(git push -o adopt the first time if the project was saved with cbx submit). Ask first.`
+    );
+  }
+  if (slug) return `To save: cbx submit -m "…" (ask first).`;
+  return `Not linked. To save, ask which project it is: cbx submit --into <project> or cbx submit --new.`;
+}
 
 /* ------------------------------------------------------------------ wire */
 

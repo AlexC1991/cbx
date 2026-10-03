@@ -51,6 +51,8 @@ export type VersionInput = {
   /** Used only when the project does not exist yet. */
   projectName: string;
   repositoryId: string | null;
+  /** False: a new project's name taken by another is reported, not joined. */
+  joinExisting?: boolean;
   /** The version this publish is based on. Null claims the project is empty. */
   baseVersionId: string | null;
   /** The line it lands on. Omitted means `main`. */
@@ -90,6 +92,7 @@ export function uploadRequestFor(input: VersionInput): UploadRequest {
     message: input.message,
     projectName: input.projectName,
     repositoryId: input.repositoryId,
+    ...(input.joinExisting === false ? { joinExisting: false } : {}),
     baseVersionId: input.baseVersionId,
     ...(input.track ? { track: input.track } : {}),
     ...(input.allowIgnored ? { allowIgnored: true } : {}),

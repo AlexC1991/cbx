@@ -14,6 +14,7 @@ import {
   link as hardLink,
   mkdir,
   readFile,
+  readdir,
   rename,
   rm,
   writeFile,
@@ -489,6 +490,12 @@ export async function forgetLink(localPath: string): Promise<boolean> {
     await writePrivate(storedFileFor(key), JSON.stringify(forgotten));
   }
   await rm(folderLinkFile(localPath), { force: true });
+  /* The folder CodeRook made for the link goes too, unless it holds anything else. */
+  const directory = path.dirname(folderLinkFile(localPath));
+  const left = await readdir(directory).catch(() => null);
+  if (left && left.length === 1 && left[0] === ".gitignore") {
+    await rm(directory, { recursive: true, force: true });
+  }
   return true;
 }
 

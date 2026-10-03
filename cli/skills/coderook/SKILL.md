@@ -1,6 +1,6 @@
 ---
 name: coderook
-description: Save, browse and restore versions of a project on CodeRook — a version host where every version is a complete snapshot and there is no git to learn. Use when asked to save or submit work to CodeRook, check what has changed, look at a project's versions or files, fetch a project, start or switch a line of work, or resolve a save that landed at the same time as somebody else's.
+description: Save, browse and restore versions of a project on CodeRook — a version host where every version is a complete snapshot, reached with the cbx command or with plain git. Use when asked to save, submit or push work to CodeRook, check what has changed, look at a project's versions or files, fetch a project, start or switch a line of work, or resolve a save that landed at the same time as somebody else's.
 allowed-tools: Bash Read
 ---
 
@@ -11,7 +11,13 @@ project had at that moment, so restoring one never depends on the versions
 around it, and there is no staging area, no branches to rebase and no history
 to rewrite.
 
-Everything here is the `coderook` command line. Run it with Bash.
+Everything here is the `cbx` command line (also installed as `coderook`), or
+git itself through CodeRook's remote helper. Run them with Bash.
+
+**Which one to use.** If the folder is a git repository (`git rev-parse` works
+in it), prefer git — see *Working in a git repository* below. Each commit then
+arrives with its own message, instead of one snapshot standing in for many.
+Use `cbx submit` for folders that are not git repositories.
 
 ## Before anything else
 
@@ -44,6 +50,21 @@ nothing.
 cbx submit -m "What changed, in a sentence"
 ```
 
+**The first save from a folder must say which project it is.** A folder that
+is not linked goes to a new project named after it — unless the account has a
+project with a name like it, and then `submit` stops and lists them. Do not
+guess: show the person the list and ask. Then run one of:
+
+```bash
+cbx submit --into <project> -m "…"   # this folder is that project
+cbx submit --new -m "…"              # a separate project (add --name if the name is taken)
+cbx link <project>                   # link only; send nothing yet
+```
+
+Never start a second project for work that already has one. A folder copied to
+another machine, another operating system or another path is still the same
+project: `cbx link` it.
+
 Send only what changed; the version still names every file. Write the message
 yourself from the actual diff rather than asking for one — a message like
 "update" helps nobody reading the history later.
@@ -55,6 +76,33 @@ explain. Propose it, say what it would send, and let them agree.
 `cbx submit -n` shows exactly what would be sent without sending it. Use
 that freely; it is safe and it is the honest way to answer "what would this
 upload?".
+
+## Working in a git repository
+
+CodeRook is a git remote. `npm install --global @coderook/cli` puts the helper
+(`git-remote-coderook`) on PATH; the plugin and `npx` do not, so check with
+`git ls-remote coderook://<project>` before relying on it.
+
+```bash
+git remote -v                                        # is there a coderook:// remote already?
+git remote add coderook coderook://<project>         # if not
+git push coderook main                               # each new commit becomes a save
+git push coderook <branch>                           # a branch becomes a line
+git push coderook v1.2.0                             # a tag names a version
+git fetch coderook                                   # bring other people's saves in
+```
+
+If the project was started with `cbx submit` or the desktop app, the first push
+is refused with a message saying so. When the repository holds that project,
+`git push -o adopt coderook main` saves the current commit on top of what is
+there, once; plain pushes work from then on. **Ask before adopting** — it is a
+save like any other. If the project is somebody else's work under the same
+name, push to a new name instead.
+
+Git's limits here: no force pushes or branch deletions (saves are permanent), a
+merge commit arrives as one save holding the merged tree, and a commit holding
+a credential is refused — take the key out of history rather than looking for
+a way round.
 
 ## Fetching
 
@@ -234,6 +282,20 @@ file with its size, SHA-256 and `url`. Updaters have no account, so the
 project they read must be public; keep private code in a separate project and
 ship releases from a public one.
 
+## Building executables for every platform
+
+```bash
+cbx build --plan                  # how this machine would build each target
+cbx build --target win,linux,mac  # build them into .coderook/build/<target>/
+```
+
+It builds on this machine, with the tools it has, and uploads nothing. Run
+`--plan` first and read it out: a target marked "no" says what would build it
+(Docker, a Mac, cargo-zigbuild) — pass that on rather than installing things
+unasked. `--ship` attaches the results to the newest save, so **ask before
+`--ship`**, as before any save. A project's own build description lives in
+`coderook.build.json`.
+
 ## Things not to do
 
 - Do not run `cbx delete` unless the person has asked for that project to
@@ -242,6 +304,8 @@ ship releases from a public one.
   again and gains nothing.
 - Do not guess a project name. `cbx projects` lists them; a folder that is
   already linked needs no name at all.
+- Do not pass `--new` to get past the question `submit` asks. It exists for a
+  separate project the person wants, not to avoid choosing.
 - Do not run `cbx take-down`. It destroys the files in a version and they do
   not come back. Say it exists and let its owner run it.
 
