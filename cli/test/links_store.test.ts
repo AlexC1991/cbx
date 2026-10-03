@@ -159,3 +159,28 @@ test("an unlinked folder on a machine with no old file is simply unlinked", asyn
   assert.equal(await readLink(folder), null);
   assert.equal(await forgetLink(folder), false);
 });
+
+test("a folder linked on one machine is recognised on another", async () => {
+  const project = await mkdtemp(path.join(tmpdir(), "coderook-shared-folder-"));
+  await fresh();
+  await writeLink(project, linked({ slug: "dual-boot" }));
+
+  /* Another machine, or the same disk from another operating system. */
+  await fresh();
+  const found = await readLink(project);
+  assert.equal(found?.slug, "dual-boot");
+  assert.equal(found?.repositoryId, "repo-1");
+
+  /* Git is told to leave it alone, and the copy carries no token. */
+  assert.equal(await readFile(path.join(project, ".coderook", ".gitignore"), "utf8"), "*\n");
+  assert.doesNotMatch(await readFile(path.join(project, ".coderook", "link.json"), "utf8"), /token/i);
+});
+
+test("unlinking on a machine is not overruled by the folder's copy", async () => {
+  const project = await mkdtemp(path.join(tmpdir(), "coderook-forget-folder-"));
+  await fresh();
+  await writeLink(project, linked({ slug: "forget-me" }));
+  await forgetLink(project);
+  assert.equal(await readLink(project), null);
+  await assert.rejects(stat(path.join(project, ".coderook", "link.json")));
+});

@@ -293,6 +293,8 @@ export async function push(
             the wrong ones. The git push sends this for the same reason.
           */
           allowIgnored: true,
+          /* The save's own record of what runs; on Windows the scratch tree cannot say. */
+          executable: new Map([...after].map(([file, entry]) => [file, entry.executable])),
           ...(options.allowSecrets ? { allowSecrets: true } : {}),
           ...(options.acknowledged ? { acknowledged: true } : {}),
           ...(known ? { known } : {}),
@@ -431,7 +433,11 @@ export async function pull(
           const was = before.get(file.path);
           const reuse = was?.sha256 === file.sha256 ? was : byDigest.get(file.sha256);
           if (reuse) {
-            entries.push({ ...reuse, path: file.path, executable: was?.executable ?? reuse.executable });
+            entries.push({
+              ...reuse,
+              path: file.path,
+              executable: file.executable ?? was?.executable ?? reuse.executable,
+            });
           } else {
             fetch.push(file);
           }
@@ -450,7 +456,7 @@ export async function pull(
             path: file.path,
             size: file.sourceSize,
             sha256: stored.sha256,
-            executable: before.get(file.path)?.executable ?? false,
+            executable: file.executable ?? before.get(file.path)?.executable ?? false,
             chunks: stored.chunks,
           };
           entries.push(entry);

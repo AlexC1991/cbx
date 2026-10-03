@@ -1,6 +1,6 @@
 {
   "name": "@coderook/cbx",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CBX: version control for projects of any size. Snapshots, content-defined chunking, a local history with merges, and sync with CodeRook.",
   "license": "Apache-2.0",
   "author": "ACCA Gaming Productions",

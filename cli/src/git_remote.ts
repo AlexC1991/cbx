@@ -48,9 +48,9 @@
  *   is nothing to rewind to. Both are refused rather than silently ignored.
  * - **Submodules.** A gitlink is a pointer into another repository and there
  *   are no bytes to publish. Skipped on push, and said out loud.
- * - **File modes.** Everything is imported as `100644`. CodeRook records an
- *   executable bit but git's mode is not round-tripped yet, so a script
- *   cloned back needs `chmod +x`.
+ * - **File modes.** The executable bit travels both ways: a pushed `100755`
+ *   is recorded as executable, and an executable file is fetched as `100755`.
+ *   Versions saved before the bit was recorded come back `100644`.
  *
  * ## What a round trip does and does not preserve
  *
@@ -257,7 +257,13 @@ class CatFile {
   }
 }
 
-type ChangeSet = { written: string[]; deleted: string[]; skipped: string[] };
+type ChangeSet = {
+  written: string[];
+  deleted: string[];
+  skipped: string[];
+  /** Whether each written file is executable (git mode 100755). */
+  executable: Map<string, boolean>;
+};
 
 /**
  * Bring the scratch tree from one commit to another, and say what moved.
@@ -286,6 +292,7 @@ async function applyCommit(
   const written: string[] = [];
   const deleted: string[] = [];
   const skipped: string[] = [];
+  const executable = new Map<string, boolean>();
 
   for (let index = 0; index + 1 < fields.length; index += 2) {
     const status = fields[index]!;
@@ -315,9 +322,10 @@ async function applyCommit(
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, bytes);
     written.push(filePath);
+    executable.set(filePath, mode === "100755");
   }
 
-  return { written, deleted, skipped };
+  return { written, deleted, skipped, executable };
 }
 
 /*
@@ -909,7 +917,9 @@ async function doImport(
           hold one, and this keeps older ones from carrying it into git.
         */
         if (file.path.split("/").some(isGitDirectoryName)) continue;
-        send(`M 100644 :${blobMark.get(file.sha256)} ${quotePath(file.path)}`);
+        send(
+          `M ${file.executable ? "100755" : "100644"} :${blobMark.get(file.sha256)} ${quotePath(file.path)}`,
+        );
       }
       send("");
 
@@ -1435,6 +1445,7 @@ async function doPush(
           baseVersionId,
           track: branch,
           allowIgnored: true,
+          executable: changes.executable,
           ...(Object.keys(manifest).length ? { known: local } : {}),
         });
 

@@ -75,6 +75,8 @@ export type VersionInput = {
   allowSecrets?: boolean;
   acknowledged?: boolean;
   acknowledgedNoLicence?: boolean;
+  /** Whether files run, by path, when the caller knows better than the disk. */
+  executable?: Map<string, boolean>;
 };
 
 /** Turn what a caller has into what the uploader expects. */
@@ -94,6 +96,7 @@ export function uploadRequestFor(input: VersionInput): UploadRequest {
     ...(input.allowSecrets ? { allowSecrets: true } : {}),
     ...(input.acknowledged ? { acknowledged: true } : {}),
     ...(input.acknowledgedNoLicence ? { acknowledgedNoLicence: true } : {}),
+    ...(input.executable ? { executable: input.executable } : {}),
     ...(input.baseVersionId
       ? { expectedHeadVersionId: input.baseVersionId }
       : {}),

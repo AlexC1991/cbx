@@ -126,14 +126,27 @@ export async function commandLicence(parsed: Parsed): Promise<number> {
   */
   let holder = flagValue(parsed, "holder") ?? "";
   if (licence.personalised && !holder) {
+    /*
+      Why the name could not be had decides what to say. This used to answer
+      every failure with "sign in", including a network timeout for somebody
+      who was signed in, and sent them to fix the wrong thing.
+    */
+    let failure: unknown = null;
     holder = await whoami()
       .then((account) => account.displayName || account.username || "")
-      .catch(() => "");
+      .catch((error: unknown) => {
+        failure = error;
+        return "";
+      });
     if (!holder) {
+      const reason = failure instanceof Error ? failure.message : "";
       console.error(red("Could not work out whose name goes on the licence."));
-      console.error(
-        `Sign in, or pass ${accent('--holder "Your Name"')} to say directly.`,
-      );
+      if (/sign-in|not signed in|not accepted/i.test(reason) || !failure) {
+        console.error(`Sign in, or pass ${accent('--holder "Your Name"')} to say directly.`);
+      } else {
+        console.error(dim(reason));
+        console.error(`Try again, or pass ${accent('--holder "Your Name"')} to say directly.`);
+      }
       return 1;
     }
   }

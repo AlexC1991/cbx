@@ -7,10 +7,11 @@
  * not a file quietly written wrong.
  */
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
+import { createGunzip, gunzipSync } from "node:zlib";
 import path from "node:path";
 import { inside, whyUnsafe } from "../shared/safe_path.js";
 
@@ -87,6 +88,8 @@ export type RemoteChunk = {
 
 export type RemoteFile = {
   path: string;
+  /** Marked to run; restored on write everywhere but Windows. */
+  executable?: boolean;
   /** The ordinary, whole-object form of this file. */
   objectId?: string;
   sha256: string;
@@ -364,6 +367,7 @@ export class Downloader {
         ...(row.objectId ? { objectId: String(row.objectId) } : {}),
         sha256: String(row.sha256 ?? ""),
         sourceSize: Number(row.sourceSize ?? 0),
+        ...(row.executable === true ? { executable: true } : {}),
         ...(row.sealed === true ? { sealed: true } : {}),
         ...(packed?.objectId
           ? {
@@ -424,7 +428,9 @@ export class Downloader {
     target: string,
   ): Promise<string> {
     await mkdir(path.dirname(target), { recursive: true });
-    return this.fetchInto(repositoryId, versionId, file, target);
+    const digest = await this.fetchInto(repositoryId, versionId, file, target);
+    await applyMode(target, file.executable === true);
+    return digest;
   }
 
   /**
@@ -582,6 +588,19 @@ export class Downloader {
     }
   }
 
+  /*
+    Paths whose bytes arrived still gzip-compressed and were recovered.
+
+    A service that recorded an object's encoding wrongly served its stored
+    gzip as though it were the file (found on CodeRook in September 2026; the
+    service now judges the encoding from the stored size). The bytes were
+    never damaged, only still compressed, so a body that fails its digest,
+    starts with gzip's magic number and decompresses to exactly the expected
+    digest is accepted. Anything else still fails. Listed here so a caller
+    can say it happened.
+  */
+  readonly recoveredFromGzip: string[] = [];
+
   private async fetchInto(
     repositoryId: string,
     versionId: string,
@@ -597,6 +616,7 @@ export class Downloader {
       that cannot match the digest this file was listed with.
     */
     const pieces = file.sealed ? [] : (file.chunks ?? []);
+    let recovered = false;
     // Captured so the generators below do not need `this` rebound.
     const request = (route: string) => this.request(route);
     const check = () => this.check();
@@ -609,7 +629,7 @@ export class Downloader {
             const reply = await request(
               `/v1/repositories/${repositoryId}/objects/${piece.objectId}`,
             );
-            const body = Buffer.from(await reply.arrayBuffer());
+            let body: Buffer = Buffer.from(await reply.arrayBuffer());
             /*
               Checked against what the upload recorded for this piece, before
               a byte of it reaches the file. Without the digest the only
@@ -618,10 +638,15 @@ export class Downloader {
             */
             const digest = createHash("sha256").update(body).digest("hex");
             if (piece.sha256 && digest !== piece.sha256) {
-              throw new Error(
-                `${file.path}: piece ${at + 1} of ${pieces.length} ` +
-                  `did not arrive intact`,
-              );
+              const plain = gunzippedMatching(body, piece.sha256);
+              if (!plain) {
+                throw new Error(
+                  `${file.path}: piece ${at + 1} of ${pieces.length} ` +
+                    `did not arrive intact`,
+                );
+              }
+              recovered = true;
+              body = plain;
             }
             whole.update(body);
             yield body;
@@ -652,7 +677,15 @@ export class Downloader {
       up holding something that looks finished.
     */
     await pipeline(source, createWriteStream(target));
-    return whole.digest("hex");
+    const digest = whole.digest("hex");
+    if (recovered) this.recoveredFromGzip.push(file.path);
+    if (!pieces.length && file.sha256 && digest !== file.sha256) {
+      if (await recoverGzipFile(target, file.sha256)) {
+        this.recoveredFromGzip.push(file.path);
+        return file.sha256;
+      }
+    }
+    return digest;
   }
 
   /**
@@ -923,6 +956,7 @@ export class Downloader {
         await mkdir(path.dirname(target), { recursive: true });
         await rm(target, { recursive: true, force: true });
         await rename(inside(staging, file.path), target);
+        await applyMode(target, file.executable === true);
         placed += 1;
         if (placed === 1) maybeFail("get:after-first-file");
       }
@@ -966,5 +1000,71 @@ export class Downloader {
       await rm(staging, { recursive: true, force: true });
       throw error;
     }
+  }
+}
+
+/** The gunzipped bytes when they hash to `expected`, otherwise null. */
+function gunzippedMatching(body: Buffer, expected: string): Buffer | null {
+  if (body.length < 2 || body[0] !== 0x1f || body[1] !== 0x8b) return null;
+  try {
+    const plain = gunzipSync(body);
+    return createHash("sha256").update(plain).digest("hex") === expected ? plain : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Replace a file that arrived still gzip-compressed with its contents, when
+ * those contents hash to `expected`. Streamed, so a large file is never held.
+ */
+async function recoverGzipFile(target: string, expected: string): Promise<boolean> {
+  const handle = await open(target, "r");
+  const magic = Buffer.alloc(2);
+  try {
+    await handle.read(magic, 0, 2, 0);
+  } finally {
+    await handle.close();
+  }
+  if (magic[0] !== 0x1f || magic[1] !== 0x8b) return false;
+  const temporary = `${target}.gunzip`;
+  const hash = createHash("sha256");
+  try {
+    await pipeline(
+      createReadStream(target),
+      createGunzip(),
+      new Transform({
+        transform(chunk, _encoding, done) {
+          hash.update(chunk as Buffer);
+          done(null, chunk);
+        },
+      }),
+      createWriteStream(temporary),
+    );
+  } catch {
+    await rm(temporary, { force: true });
+    return false;
+  }
+  if (hash.digest("hex") !== expected) {
+    await rm(temporary, { force: true });
+    return false;
+  }
+  await rename(temporary, target);
+  return true;
+}
+
+/**
+ * Give a written file the execute bit its version records, or take it away.
+ *
+ * Windows has no execute bit, so nothing is done there. Elsewhere a script
+ * that came back as an ordinary file could not be run until somebody noticed
+ * and ran chmod, which on Linux was every shell script in every clone.
+ */
+export async function applyMode(target: string, executable: boolean): Promise<void> {
+  if (process.platform === "win32") return;
+  try {
+    await chmod(target, executable ? 0o755 : 0o644);
+  } catch {
+    /* A file that cannot take a mode is still the right file. */
   }
 }

@@ -331,7 +331,7 @@ does not already have.
 | Tag kind | A lightweight tag comes back annotated. CodeRook records a name, not which sort of tag made it. |
 | Force pushes, branch deletion | Refused — versions are immutable, so there is nothing to rewind to. |
 | Submodules | Skipped on push, and it says which paths. |
-| The executable bit | Everything arrives as a normal file. A script cloned back needs `chmod +x`. |
+| The executable bit | Kept: a script pushed as `100755` clones back executable, with `cbx clone` and `git clone` alike. Versions saved before 0.33 recorded every file as not executable. |
 
 **On round trips.** Push then clone gives you back the same *files*, not the
 same *commit ids*. A commit id covers its author, committer and timestamps,

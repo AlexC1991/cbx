@@ -13,7 +13,8 @@
 import { createInterface } from "node:readline/promises";
 import os from "node:os";
 import { rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -96,6 +97,7 @@ import {
 } from "./version_commands.js";
 import { declareClient } from "../../cbx/src/core/identify.js";
 import { commandDiff } from "./diff_command.js";
+import { describeError, tuneNetwork } from "./network.js";
 import {
   commandInit,
   commandRestore,
@@ -798,9 +800,61 @@ async function commandImport(parsed: Parsed): Promise<number> {
   return code;
 }
 
+/** A file's SHA-256, streamed; null when it cannot be read. */
+async function digestOfFile(full: string): Promise<string | null> {
+  try {
+    const hash = createHash("sha256");
+    for await (const block of createReadStream(full)) hash.update(block as Buffer);
+    return hash.digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Say so when files deleted here are still in the saved version.
+ *
+ * A plain save adds and updates and never removes, so a deleted or moved file
+ * lives on in every save after it until somebody passes --sync. `status`
+ * already said this; `submit` did not, and from Linux a project turned out to
+ * carry a stale copy of a whole app at its root for weeks. Counted from the
+ * folder's record of what it holds, so it costs a stat per recorded file.
+ */
+function noteKeptDeletions(
+  folder: string,
+  baseline: Map<string, string> | null,
+  syncing: boolean,
+): void {
+  if (syncing || !baseline?.size) return;
+  const gone = [...baseline.keys()].filter(
+    (file) => !existsSync(path.join(folder, ...file.split("/"))),
+  );
+  if (!gone.length) return;
+  console.log(
+    dim(
+      `${gone.length} file${gone.length === 1 ? "" : "s"} deleted here ${gone.length === 1 ? "is" : "are"} still in the saved version` +
+        ` (${gone.slice(0, 3).join(", ")}${gone.length > 3 ? ", …" : ""}). A save adds and updates;` +
+        ` run cbx submit --sync to remove ${gone.length === 1 ? "it" : "them"}.`,
+    ),
+  );
+}
+
 async function commandSubmit(parsed: Parsed): Promise<number> {
   const folder = folderFor(parsed);
   const message = flagText(parsed, "m", "message") ?? "";
+  /*
+    Checked before anything is scanned or planned. The service's own refusal
+    arrived after the upload plan had been printed, as a schema error about
+    "<=240 characters", which reads like a fault rather than a limit.
+  */
+  if (message.trim().length > 240) {
+    console.error(
+      red(`The message is ${message.trim().length} characters; the limit is 240.`),
+    );
+    console.error(dim("Put the detail in release notes or a NOTES file, and keep the message to a line."));
+    return 1;
+  }
+  const dryRun = hasFlag(parsed, "dry-run", "n");
   const { link, baseline, behind, member } = await reconcile(folder);
   /*
     Somebody else's project, cloned from its public page. Reading and
@@ -831,7 +885,13 @@ async function commandSubmit(parsed: Parsed): Promise<number> {
     Only on a project's first save. After that an absent LICENSE is somebody's
     decision and putting one back would be arguing with them.
   */
-  const added = link
+  /*
+    A dry run changes nothing, and that includes writing a LICENSE: it says
+    what would be added instead.
+  */
+  const wouldLicence =
+    dryRun && !link && !hasFlag(parsed, "no-licence") && !existsSync(path.join(folder, "LICENSE"));
+  const added = link || dryRun
     ? null
     : await licenceNewProject(
         folder,
@@ -1092,6 +1152,12 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
     console.log(dim("Sending them anyway, because --allow-secrets was given."));
   }
 
+  if (wouldLicence) {
+    console.log(
+      `${accent("Would add an MIT licence")} on a real save, so other people may use this.` +
+        dim(" Pass --no-licence to leave it out."),
+    );
+  }
   if (added) {
     console.log(
       `${accent("Added an MIT licence")}, so other people may use this.`,
@@ -1245,12 +1311,21 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
               `${bytes(plan.allowance.remainingBytes)} remains after this reservation.`,
           ),
     );
-    if (hasFlag(parsed, "dry-run", "n")) {
+    if (dryRun) {
       await uploader.cancelPlan(plan, true);
+      const going = files.filter((file) => !file.deleted);
+      const removing = files.filter((file) => file.deleted);
       console.log(
-        `${files.length} file${files.length === 1 ? "" : "s"} would be sent or reused:`,
+        `${going.length} file${going.length === 1 ? "" : "s"} would be sent or reused:`,
       );
-      for (const file of files) console.log(`  ${file.path}`);
+      for (const file of going) console.log(`  ${file.path}`);
+      if (removing.length) {
+        console.log(
+          `${removing.length} file${removing.length === 1 ? "" : "s"} would be removed from the save:`,
+        );
+        for (const file of removing) console.log(`  ${red("deleted")} ${file.path}`);
+      }
+      noteKeptDeletions(folder, baseline, hasFlag(parsed, "sync"));
       console.log("Nothing was uploaded and no Version was created.");
       return 0;
     }
@@ -1274,7 +1349,7 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
       the work was saved.
     */
     const failure = classifyPublishFailure(error);
-    const text = error instanceof Error ? error.message : String(error);
+    const text = describeError(error);
     if (failure?.kind === "interrupted") {
       console.error(red(`
 The connection failed: ${text}`));
@@ -1424,6 +1499,7 @@ The connection failed: ${text}`));
       */
       ` · the save holds ${bytes(result.sourceBytes)}`,
   );
+  noteKeptDeletions(folder, baseline, hasFlag(parsed, "sync"));
   /*
     Where the time went, when asked for.
 
@@ -1581,12 +1657,20 @@ Save them with ${accent("cbx submit")}, or finish the fetch and ` +
         and stopping for those would make the warning something people learn
         to click past.
       */
-      const atRisk = edited.filter(
-        (file) =>
-          !file.deleted &&
-          incoming.has(file.path) &&
-          incoming.get(file.path) !== link.local![file.path],
-      );
+      const atRisk: typeof edited = [];
+      for (const file of edited) {
+        if (file.deleted || !incoming.has(file.path)) continue;
+        if (incoming.get(file.path) === link.local![file.path]) continue;
+        /*
+          Already exactly what is arriving: nothing would be lost by writing
+          it. This is what the same folder looks like after being saved from
+          another machine or another operating system, and refusing it left
+          a folder that could neither fetch nor save without a merge.
+        */
+        const here = await digestOfFile(path.join(folder, ...file.path.split("/")));
+        if (here === incoming.get(file.path)) continue;
+        atRisk.push(file);
+      }
       if (atRisk.length) {
         console.error(
           red(
@@ -1775,6 +1859,19 @@ async function fetchInto(
     mode,
   );
   done(line);
+  /*
+    Said, not hidden. The files are right, but the service sent them still
+    compressed, which means its record of how they are stored is wrong.
+  */
+  if (downloader.recoveredFromGzip.length) {
+    console.log(
+      dim(
+        `${downloader.recoveredFromGzip.length} file${downloader.recoveredFromGzip.length === 1 ? "" : "s"} ` +
+          `arrived still compressed and were unpacked here; the copies are exact. ` +
+          `Tell security@coderook.com if this keeps happening.`,
+      ),
+    );
+  }
   // Fetching is how a folder catches up, so this is what moves its base.
   await writeLink(destination, {
     repositoryId,
@@ -3703,9 +3800,10 @@ function leave(code: number): void {
   process.exitCode = code;
 }
 
+tuneNetwork();
 main(process.argv.slice(2))
   .then(leave)
   .catch((error: unknown) => {
-    console.error(red(error instanceof Error ? error.message : String(error)));
+    console.error(red(describeError(error)));
     leave(1);
   });

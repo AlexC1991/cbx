@@ -401,25 +401,72 @@ async function migrateLegacyLinks(): Promise<void> {
   await rename(claimed, `${legacy}.migrated`).catch(() => undefined);
 }
 
-async function lookUp(localPath: string): Promise<Link | null> {
+async function lookUp(localPath: string): Promise<Link | null | "forgotten"> {
   for (const key of new Set([keyFor(localPath), legacyKeyFor(localPath)])) {
     const stored = await readStored(key);
     if (!stored) continue;
-    if ("forgotten" in stored) return null;
+    if ("forgotten" in stored) return "forgotten";
     return unpack(stored);
   }
   return null;
 }
 
+/*
+  A copy of the link kept in the folder itself, beside the offline outbox.
+
+  The machine's own record is keyed by the folder's path, so the same folder
+  seen from another operating system (a drive letter from Windows, a mount
+  point from Linux, on the same disk) or from another machine was a stranger,
+  and every project had to be cloned again into a new folder. `.coderook` is
+  never scanned or uploaded, and the copy holds no token: only which project
+  and version the folder stands on, as `.git` records its remote.
+*/
+const folderLinkFile = (localPath: string) =>
+  path.join(path.resolve(localPath), ".coderook", "link.json");
+
+async function readFolderLink(localPath: string): Promise<Link | null> {
+  try {
+    const raw = JSON.parse(await readFile(folderLinkFile(localPath), "utf8")) as Partial<Link>;
+    if (typeof raw.repositoryId !== "string" || typeof raw.slug !== "string") return null;
+    return {
+      ...raw,
+      manifest: raw.manifest ?? {},
+      sequence: Number(raw.sequence ?? 0),
+    } as Link;
+  } catch {
+    return null;
+  }
+}
+
+async function writeFolderLink(localPath: string, link: Link): Promise<void> {
+  try {
+    const directory = path.dirname(folderLinkFile(localPath));
+    await mkdir(directory, { recursive: true });
+    /* Git leaves it alone too, without anybody editing their .gitignore. */
+    await writeFile(path.join(directory, ".gitignore"), "*\n").catch(() => undefined);
+    await writeFile(folderLinkFile(localPath), JSON.stringify(link));
+  } catch {
+    /* A folder that cannot hold the copy still has the machine's record. */
+  }
+}
+
 export async function readLink(localPath: string): Promise<Link | null> {
-  let link = await lookUp(localPath);
+  let found = await lookUp(localPath);
   if (
-    !link &&
+    !found &&
     ((await exists(legacyLinksFile())) ||
       (await exists(`${legacyLinksFile()}.migrating`)))
   ) {
     await migrateLegacyLinks();
-    link = await lookUp(localPath);
+    found = await lookUp(localPath);
+  }
+  /* Unlinked on this machine on purpose: the folder's copy does not overrule that. */
+  if (found === "forgotten") return null;
+  let link = found;
+  if (!link) {
+    link = await readFolderLink(localPath);
+    /* Adopted, so this machine knows the folder from now on. */
+    if (link) await writeLink(localPath, link);
   }
   if (!link) return null;
   return {
@@ -441,6 +488,7 @@ export async function forgetLink(localPath: string): Promise<boolean> {
     const forgotten: StoredLink = { key, forgotten: true };
     await writePrivate(storedFileFor(key), JSON.stringify(forgotten));
   }
+  await rm(folderLinkFile(localPath), { force: true });
   return true;
 }
 
@@ -452,6 +500,10 @@ export async function writeLink(localPath: string, link: Link): Promise<void> {
     ...(baseVersionId ? { baseVersionId, versionId: baseVersionId } : {}),
   });
   await writePrivate(storedFileFor(key), JSON.stringify(stored));
+  await writeFolderLink(localPath, {
+    ...link,
+    ...(baseVersionId ? { baseVersionId, versionId: baseVersionId } : {}),
+  });
   // A folder recorded under the old key moves to the new one rather than
   // being left behind as a second connection to the same place.
   const legacy = legacyKeyFor(localPath);

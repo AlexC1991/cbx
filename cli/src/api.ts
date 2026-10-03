@@ -1,4 +1,5 @@
 /** The small part of the API the command-line tool needs directly. */
+import { describeError, isNetworkFailure, pause } from "./network.js";
 import { clientHeaders } from "../../cbx/src/core/identify.js";
 import { apiOrigin, loadToken } from "./config.js";
 
@@ -69,18 +70,35 @@ async function call<T>(
   if (!token) {
     throw new Error("Not signed in. Run: cbx sign-in");
   }
-  const response = await fetch(`${apiOrigin()}${route}`, {
-    method: options.method ?? "GET",
-    headers: {
-      accept: "application/json",
-      authorization: `Bearer ${token}`,
-      "user-agent": "CodeRook-CLI/0.1",
-      ...clientHeaders(),
-      ...(options.body ? { "content-type": "application/json" } : {}),
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-    signal: AbortSignal.timeout(REQUEST_DEADLINE_MS),
-  });
+  const method = options.method ?? "GET";
+  /*
+    A read that failed before any answer is asked again, twice, with a pause.
+    Only reads: a write that may have landed is the caller's to retry, with
+    what it knows about idempotency.
+  */
+  let response: Response | undefined;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      response = await fetch(`${apiOrigin()}${route}`, {
+        method,
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${token}`,
+          "user-agent": "CodeRook-CLI/0.1",
+          ...clientHeaders(),
+          ...(options.body ? { "content-type": "application/json" } : {}),
+        },
+        body: options.body ? JSON.stringify(options.body) : undefined,
+        signal: AbortSignal.timeout(REQUEST_DEADLINE_MS),
+      });
+      break;
+    } catch (error) {
+      if (method !== "GET" || attempt >= 3 || !isNetworkFailure(error)) {
+        throw new Error(describeError(error), { cause: error });
+      }
+      await pause(500 * attempt);
+    }
+  }
   const text = await response.text();
   const body = text ? JSON.parse(text) : {};
   if (!response.ok) {
@@ -340,7 +358,15 @@ export async function findProject(
     the authenticated listing knows about private projects the public one
     cannot see.
   */
-  const all = await projects().catch(() => [] as AccountProject[]);
+  /*
+    Only the service saying no becomes "no projects". A network failure or a
+    missing sign-in is said as itself: swallowing it here turned a timeout
+    into "No project matching", which sent somebody looking for a typo.
+  */
+  const all = await projects().catch((error: unknown) => {
+    if (error instanceof ServiceError) return [] as AccountProject[];
+    throw error;
+  });
   const ownersMatch = (project: AccountProject) =>
     project.slug.toLowerCase() === bare || project.name.toLowerCase() === bare;
 

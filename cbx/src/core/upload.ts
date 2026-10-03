@@ -293,6 +293,12 @@ export type UploadRequest = {
   */
   track?: string;
   /*
+    Whether files run, by path, when the caller knows better than the disk:
+    a local history pushing from Windows, where there is no execute bit to
+    read but the save recorded one. Anything not named is read from the file.
+  */
+  executable?: Map<string, boolean>;
+  /*
     The paths this workspace believed the project held. Without it a file
     that is in the published version but not on this disk is
     indistinguishable from one this person deleted — and treating the first
@@ -327,6 +333,8 @@ type PublishFile = {
   sourceSize: number;
   storedSize: number;
   mediaType: string;
+  /** Marked to run. Absent is worked out at publish time; see executableFor. */
+  executable?: boolean;
 };
 
 /**
@@ -452,6 +460,8 @@ type PriorFile = {
   sourceSize: number;
   storedSize: number;
   mediaType: string;
+  /** Whether the previous version marked this file to run. */
+  executable: boolean;
 };
 
 
@@ -1251,9 +1261,22 @@ export class Uploader {
           sourceSize: held.sourceSize,
           storedSize: held.storedSize,
           mediaType: held.mediaType,
+          executable: request.executable?.get(file.path) ?? held.executable,
         };
       }),
     ].sort((left, right) => left.path.localeCompare(right.path));
+    /*
+      Whether each sent file runs. Every file used to go up as not, so a
+      script cloned on Linux came back unusable until somebody ran chmod.
+    */
+    for (const item of contents) {
+      if (item.executable !== undefined) continue;
+      item.executable = await executableFor(
+        request,
+        item.path,
+        prior.get(item.path)?.executable ?? false,
+      );
+    }
 
     /*
       Last check before the version is written: everything the person ticked
@@ -1396,7 +1419,7 @@ export class Uploader {
           sourceSize: item.sourceSize,
           storedSize: item.storedSize,
           mediaType: item.mediaType,
-          executable: false,
+          executable: item.executable === true,
         })),
       }),
     }));
@@ -2341,6 +2364,7 @@ export class Uploader {
           sourceSize: Number(row.sourceSize ?? 0),
           storedSize: Number(row.storedSize ?? 0),
           mediaType: String(row.mediaType ?? "application/octet-stream"),
+          executable: row.executable === true,
         });
       }
     } catch {
@@ -3475,5 +3499,27 @@ export class Uploader {
       chunks.push(chunk as Buffer);
     }
     return new Uint8Array(Buffer.concat(chunks));
+  }
+}
+
+/**
+ * Whether a file being sent is marked to run.
+ *
+ * The caller's word first, then the file's own mode. Windows has no execute
+ * bit to read, so there a file keeps whatever the previous version said,
+ * rather than every save from Windows quietly clearing it.
+ */
+async function executableFor(
+  request: UploadRequest,
+  relative: string,
+  before: boolean,
+): Promise<boolean> {
+  const told = request.executable?.get(relative);
+  if (told !== undefined) return told;
+  if (process.platform === "win32") return before;
+  try {
+    return ((await stat(path.join(request.localPath, relative))).mode & 0o111) !== 0;
+  } catch {
+    return before;
   }
 }

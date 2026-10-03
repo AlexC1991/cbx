@@ -61,6 +61,8 @@ function fakeService(seen: Seen) {
             sourceSize: body.length,
             storedSize: body.length,
             mediaType: "text/plain",
+            /* One script among the files, so the bit can be seen to carry. */
+            executable: file === "src/file-03.ts",
           };
           offset += body.length;
           return row;
@@ -133,7 +135,11 @@ function fakeService(seen: Seen) {
   }) as typeof fetch;
 }
 
-async function save(change: (folder: string) => Promise<void>, deletions: string[] = []) {
+async function save(
+  change: (folder: string) => Promise<void>,
+  deletions: string[] = [],
+  extra: Record<string, unknown> = {},
+) {
   const folder = await mkdtemp(path.join(os.tmpdir(), "coderook-kept-"));
   await mkdir(path.join(folder, "src"), { recursive: true });
   for (const [file, body] of Object.entries(BASE)) await writeFile(path.join(folder, file), body);
@@ -156,6 +162,7 @@ async function save(change: (folder: string) => Promise<void>, deletions: string
         projectName: "kept",
         repositoryId,
         baseVersionId,
+        ...extra,
       },
       () => undefined,
     );
@@ -201,4 +208,32 @@ test("a save that only deletes sends nothing at all", async () => {
   assert.equal(seen.putBodies, 0);
   assert.ok(!(changed in result.manifest));
   assert.equal(Object.keys(result.manifest).length, 39);
+});
+
+test("an unchanged file keeps the execute bit the last version gave it", async () => {
+  const { seen } = await save((folder) =>
+    writeFile(path.join(folder, changed), "export const changed = true;\n"),
+  );
+  const script = seen.published.find((one) => one.path === "src/file-03.ts");
+  assert.equal(script?.executable, true);
+  const other = seen.published.find((one) => one.path === "src/file-04.ts");
+  assert.equal(other?.executable, false);
+});
+
+test("a sent file takes the execute bit the caller says it has", async () => {
+  const { seen } = await save(
+    (folder) => writeFile(path.join(folder, changed), "#!/bin/sh\necho changed\n"),
+    [],
+    { executable: new Map([[changed, true]]) },
+  );
+  assert.equal(seen.published.find((one) => one.path === changed)?.executable, true);
+});
+
+test("off Windows, a sent file's own mode says whether it runs", { skip: process.platform === "win32" }, async () => {
+  const { chmod } = await import("node:fs/promises");
+  const { seen } = await save(async (folder) => {
+    await writeFile(path.join(folder, changed), "#!/bin/sh\necho changed\n");
+    await chmod(path.join(folder, changed), 0o755);
+  });
+  assert.equal(seen.published.find((one) => one.path === changed)?.executable, true);
 });
