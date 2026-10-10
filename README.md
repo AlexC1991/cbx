@@ -74,7 +74,7 @@ cannot drift apart unnoticed.
 
 ## Build and test
 
-Node 20.11 or later.
+Node 22.15 or later (it uses `zlib`'s zstd, added in 22.15 and 23.8).
 
 ```bash
 cd cbx && npm ci && npm test

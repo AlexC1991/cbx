@@ -32,7 +32,7 @@ project moved by one is understood by the other.
 
 ## Install
 
-Requires Node 20.11 or later, and nothing else.
+Requires Node 22.15 or later (Node 24 is the safe choice), and nothing else. Older Node lacks the zstd support bundles use, and the CLI says so rather than failing later.
 
 ```
 npm install --global @coderook/cli
@@ -446,16 +446,17 @@ cbx build init                    describe the build in coderook.build.json
 ```
 
 `cbx build` makes the project's executables for Windows, Linux and macOS on
-the machine you are using. Each target is built natively, cross-compiled, in
-Docker or in WSL, chosen from what is installed; one that cannot be built here
-is named, with what would build it.
+the machine you are using. Each target is built natively or cross-compiled,
+chosen from what is installed; Docker and WSL are used when present and never
+required for Linux. A target that cannot be built here is named, with what
+would build it.
 
 | Toolchain | From any machine | Needs its own system |
 | --- | --- | --- |
 | Go, Bun, Deno, .NET | Windows, Linux, macOS | — |
 | Rust | all three, with cargo-zigbuild | macOS apps using system frameworks |
-| Electron | Windows and Linux, with Docker (or wine) | macOS |
-| PyInstaller | Linux, with Docker or WSL | Windows, macOS |
+| Electron | Linux (tar.gz) straight from Windows; Windows and Linux elsewhere with Docker or wine | macOS; AppImage and deb need Linux |
+| Python | Windows, Linux, macOS: the target's own CPython with its wheels, as a tar.gz with a launcher (PyInstaller where it runs) | a dependency with no wheel for that system |
 
 The toolchain is recognised from the files present. `coderook.build.json`
 settles it, and takes a command of your own (`{target}`, `{os}`, `{arch}` and

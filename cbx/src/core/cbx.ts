@@ -18,6 +18,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
+  chmod,
   mkdir,
   open as openFile,
   readdir,
@@ -27,6 +28,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import process from "node:process";
 import { inside } from "../shared/safe_path.js";
 import { constants, zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
@@ -523,6 +525,14 @@ export async function unpackBundle(
         throw new Error(`${record.path} did not survive the bundle intact`);
       }
       await writeFile(full, contents);
+      /*
+        The mode was recorded when the bundle was made and never put back, so
+        a script that went in executable came out needing chmod. Only the
+        permission bits, and only where the system has them.
+      */
+      if (process.platform !== "win32" && record.mode & 0o111) {
+        await chmod(full, (record.mode & 0o777) | 0o400);
+      }
       written += 1;
       bytes += contents.length;
     }

@@ -16,7 +16,7 @@ import { gzipSync } from "node:zlib";
  * from one Windows machine, checked by their headers.
  */
 
-const { planBuild, parseTargets, describeProject, wslPath, fileFromTar } = await import(
+const { planBuild, parseTargets, describeProject, wslPath, fileFromTar, markExecutables } = await import(
   "../dist/cli/src/build_command.js"
 );
 
@@ -70,10 +70,10 @@ test("a missing toolchain says what to install", () => {
   assert.match(one!.why!, /needs Go/);
 });
 
-test("Electron: macOS only on a Mac, Windows and Linux through Docker elsewhere", () => {
+test("Electron: macOS only on a Mac; Linux from Windows directly; Docker otherwise", () => {
   const targets = ["windows-x64", "linux-x64", "macos-arm64"];
-  assert.deepEqual(routes(planBuild(project("electron"), windows, { docker: true }, targets)), {
-    "windows-x64": "native", "linux-x64": "docker", "macos-arm64": "no",
+  assert.deepEqual(routes(planBuild(project("electron"), windows, {}, targets)), {
+    "windows-x64": "native", "linux-x64": "cross", "macos-arm64": "no",
   });
   assert.deepEqual(routes(planBuild(project("electron"), linux, { docker: true }, targets)), {
     "windows-x64": "docker", "linux-x64": "native", "macos-arm64": "no",
@@ -86,8 +86,11 @@ test("Electron: macOS only on a Mac, Windows and Linux through Docker elsewhere"
   });
   const [macFromWindows] = planBuild(project("electron"), windows, {}, ["macos-arm64"]) as Planned[];
   assert.match(macFromWindows!.why!, /only macOS has/);
-  const [linuxNoDocker] = planBuild(project("electron"), windows, {}, ["linux-x64"]) as Planned[];
-  assert.match(linuxNoDocker!.why!, /needs Docker running/);
+  const [linuxFromWindows] = planBuild(project("electron"), windows, {}, ["linux-x64"]) as Array<Planned & { steps: object[] }>;
+  assert.match(linuxFromWindows!.how!, /tar\.gz/);
+  assert.ok(linuxFromWindows!.steps.some((step) => "fixTarModes" in step), "programs are marked executable afterwards");
+  const [linuxFromMacNoDocker] = planBuild(project("electron"), mac, {}, ["linux-x64"]) as Planned[];
+  assert.match(linuxFromMacNoDocker!.why!, /needs Docker running/);
 });
 
 test("PyInstaller builds its own system, and Linux through Docker or WSL", () => {
@@ -158,4 +161,37 @@ test("helpers: WSL paths and reading one file out of a tar", () => {
   assert.equal(fileFromTar(tar, "package/bin/bun")?.toString(), "hello");
   assert.equal(fileFromTar(tar, "package/bin/other"), null);
   void gzipSync;
+});
+
+test("programs in a tar made on Windows are marked executable, and nothing else", () => {
+  const entry = (name: string, body: Buffer) => {
+    const header = Buffer.alloc(512);
+    header.write(name, 0);
+    header.write("0000644\0", 100);
+    header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
+    header.write("0", 156);
+    header.fill(0x20, 148, 156);
+    let sum = 0;
+    for (const byte of header) sum += byte;
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148);
+    return Buffer.concat([header, body, Buffer.alloc((512 - (body.length % 512)) % 512)]);
+  };
+  const elf = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(60)]);
+  const tar = Buffer.concat([
+    entry("app/coderook", elf),
+    entry("app/run.sh", Buffer.from("#!/bin/sh\necho hi\n")),
+    entry("app/resources.pak", Buffer.from("data")),
+    Buffer.alloc(1024),
+  ]);
+  const { archive, marked } = markExecutables(tar);
+  assert.deepEqual(marked, ["app/coderook", "app/run.sh"]);
+  const modeAt = (offset: number) => archive.toString("latin1", offset + 100, offset + 107);
+  assert.equal(modeAt(0), "0000755");
+  assert.equal(modeAt(1024), "0000755");
+  assert.equal(modeAt(2048), "0000644");
+  /* The checksum still holds, so tar reads the archive. */
+  const header = Buffer.from(archive.subarray(0, 512));
+  const stored = parseInt(header.toString("latin1", 148, 154), 8);
+  header.fill(0x20, 148, 156);
+  assert.equal(stored, header.reduce((total, byte) => total + byte, 0));
 });

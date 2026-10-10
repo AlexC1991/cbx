@@ -39,6 +39,7 @@ import { bar } from "./progress.js";
 import { classifyPublishFailure, uploadRequestFor } from "./publish.js";
 import { commandAttach } from "./attach_command.js";
 import { commandBuild } from "./build_command.js";
+import { nodeTooOld } from "./node_check.js";
 import { commandPages } from "./pages_command.js";
 import {
   commandAi,
@@ -525,8 +526,7 @@ async function commandUnlink(parsed: Parsed): Promise<number> {
     return 0;
   }
   console.log(
-    `Detached ${bold(path.basename(folder))}` +
-      (link?.slug ? dim(` from ${link.slug}`) : "") +
+    (link?.slug ? `Unlinked this folder from ${bold(link.slug)}` : `Unlinked ${bold(path.basename(folder))}`) +
       ".",
   );
   console.log(
@@ -3893,8 +3893,9 @@ SPECS.push({
   detail:
     "Builds the project in this folder for each target, using whatever this\n" +
     "machine has: Go, Bun, Deno and .NET build every platform from any one;\n" +
-    "Rust does with cargo-zigbuild; Electron builds Windows and Linux in\n" +
-    "Docker; PyInstaller builds Linux in Docker or WSL. A target this machine\n" +
+    "Rust does with cargo-zigbuild; Electron builds Linux from Windows with\n" +
+    "nothing extra; Python ships the target's own interpreter and wheels.\n" +
+    "Linux never needs Docker. A target this machine\n" +
     "cannot build is named, with what would build it. Nothing is uploaded\n" +
     "unless --ship is given. Output goes to .coderook/build/<target>/.\n\n" +
     "The toolchain is recognised from the files here. To fix it, or to give\n" +
@@ -3903,7 +3904,7 @@ SPECS.push({
   options: [
     { flags: "-t, --target <list>", description: "windows-x64, linux-arm64, macos-arm64 … or win, linux, mac, all" },
     { flags: "--plan", description: "say how each target would be built, build nothing" },
-    { flags: "--preset <name>", description: "go, bun, deno, rust, dotnet, electron, pyinstaller or custom" },
+    { flags: "--preset <name>", description: "go, bun, deno, rust, dotnet, electron, pyinstaller, python or custom" },
     { flags: "--ship", description: "attach what was built to the project's newest save" },
   ],
   examples: [
@@ -3959,6 +3960,11 @@ SPECS.push(
 const REGISTRY = buildRegistry(SPECS);
 
 async function main(argv: string[]): Promise<number> {
+  const old = nodeTooOld();
+  if (old) {
+    console.error(red(old));
+    return 1;
+  }
   const [name, ...rest] = argv;
 
   if (!name || name === "--help" || name === "-h") {

@@ -10,6 +10,7 @@
 import process from "node:process";
 
 import { AlreadyReported, main } from "./git_remote.js";
+import { nodeTooOld } from "./node_check.js";
 
 /**
  * Finish, without cutting the pipe to git mid-sentence.
@@ -34,7 +35,8 @@ function finish(code: number): void {
   setTimeout(() => process.exit(code), 5000).unref();
 }
 
-main(process.argv.slice(2))
+const old = nodeTooOld();
+(old ? Promise.reject(new Error(old)) : main(process.argv.slice(2)))
   .then(finish)
   .catch((error: unknown) => {
     /*

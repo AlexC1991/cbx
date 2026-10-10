@@ -55,3 +55,16 @@ test("a deadline says it was a deadline", () => {
 test("anything else keeps its own message", () => {
   assert.equal(describeError(new Error("That token was not accepted. Run: cbx sign-in")), "That token was not accepted. Run: cbx sign-in");
 });
+
+test("a Node without zstd is told so by name, before anything runs", async () => {
+  const zlib = await import("node:zlib");
+  const { nodeTooOld, MINIMUM_NODE } = await import("../dist/cli/src/node_check.js");
+  assert.equal(nodeTooOld(), null, "this Node has zstd");
+  const real = (zlib.default as { zstdDecompressSync?: unknown }).zstdDecompressSync;
+  (zlib.default as { zstdDecompressSync?: unknown }).zstdDecompressSync = undefined;
+  try {
+    assert.match(nodeTooOld()!, new RegExp(`needs Node ${MINIMUM_NODE.replace(".", "\.")} or later; this is Node`));
+  } finally {
+    (zlib.default as { zstdDecompressSync?: unknown }).zstdDecompressSync = real;
+  }
+});

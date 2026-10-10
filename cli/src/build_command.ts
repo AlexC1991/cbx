@@ -24,7 +24,7 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import os from "node:os";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, stat, copyFile, writeFile } from "node:fs/promises";
@@ -32,6 +32,7 @@ import path from "node:path";
 import process from "node:process";
 
 import type { Parsed } from "./registry.js";
+import { buildPortablePython, type PyTarget } from "./portable_python.js";
 
 const ESC = String.fromCharCode(27);
 const colour = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -87,7 +88,7 @@ export function thisHost(): Host {
 
 export type ToolName =
   | "go" | "bun" | "deno" | "cargo" | "rustup" | "zigbuild" | "cross" | "dotnet"
-  | "docker" | "wsl" | "wslPython" | "pyinstaller" | "wine" | "node";
+  | "docker" | "wsl" | "wslPython" | "pyinstaller" | "wine" | "node" | "python" | "uv";
 export type Tools = Partial<Record<ToolName, boolean>>;
 
 /** Whether a command answers within a few seconds, without a shell. */
@@ -129,6 +130,8 @@ export async function detectTools(host: Host = thisHost()): Promise<Tools> {
     /* The daemon, not the client: a stopped Docker Desktop answers --version. */
     ["docker", answers("docker", ["info", "--format", "{{.ServerVersion}}"], 15000)],
     ["pyinstaller", answers("pyinstaller", ["--version"], 15000)],
+    ["uv", answers("uv", ["--version"])],
+    ["python", answers(host.os === "windows" ? "python" : "python3", ["-m", "pip", "--version"], 15000)],
     ["wine", host.os === "windows" ? Promise.resolve(false) : answers("wine", ["--version"])],
     ["node", answers(process.execPath, ["--version"])],
   ];
@@ -145,7 +148,7 @@ export async function detectTools(host: Host = thisHost()): Promise<Tools> {
 
 /* ------------------------------------------------------------ project */
 
-export type Preset = "go" | "bun" | "deno" | "rust" | "dotnet" | "electron" | "pyinstaller" | "custom";
+export type Preset = "go" | "bun" | "deno" | "rust" | "dotnet" | "electron" | "pyinstaller" | "python" | "custom";
 
 export type BuildConfig = {
   preset?: Preset;
@@ -167,6 +170,10 @@ export type BuildConfig = {
    */
   command?: string;
   docker?: Partial<Record<Target, string>>;
+  /** Python: the interpreter version to ship, as major.minor. */
+  python?: string;
+  /** Python on Windows: start without a console window. */
+  gui?: boolean;
 };
 
 export type Project = {
@@ -218,6 +225,7 @@ export async function describeProject(folder: string): Promise<Project> {
     else if (here("deno.json") || here("deno.jsonc")) preset = "deno";
     else if (here("bun.lock") || here("bun.lockb") || here("bunfig.toml")) preset = "bun";
     else if (spec || (await readFile(path.join(folder, "requirements.txt"), "utf8").catch(() => "")).match(/pyinstaller/i)) preset = "pyinstaller";
+    else if (here("requirements.txt") || here("pyproject.toml") || here("main.py") || here("app.py")) preset = "python";
   }
 
   let name = config.name ?? "";
@@ -249,7 +257,7 @@ export async function describeProject(folder: string): Promise<Project> {
       ["main.ts", "mod.ts", "index.ts", "src/main.ts", "src/index.ts", "index.js"].find(here) ??
       null;
   }
-  if (preset === "pyinstaller") {
+  if (preset === "pyinstaller" || preset === "python") {
     entry ??= spec ?? ["main.py", "app.py", "__main__.py", "src/main.py"].find(here) ?? null;
   }
   if (!name && typeof pkg?.name === "string") name = pkg.name;
@@ -279,7 +287,11 @@ export type Exec =
   | { shell: string; env?: Record<string, string> }
   | { copy: { from: string; to: string } }
   /* Bun's runtime for another system, fetched and checked here; see bunRuntime. */
-  | { bunRuntime: { target: Target; to: string } };
+  | { bunRuntime: { target: Target; to: string } }
+  /* Linux archives made on Windows: mark the programs in them executable. */
+  | { fixTarModes: string }
+  /* A Python program for any system, from parts; see portable_python.ts. */
+  | { portablePython: { target: Target; out: string } };
 
 /** Where fetched toolchain pieces are kept between builds. */
 function cacheDirectory(): string {
@@ -356,8 +368,23 @@ export function planBuild(project: Project, host: Host, tools: Tools, targets: T
     const sameOs = host.os === os_;
     const file = `${project.name}-${target}${exe(target)}`;
     const pre: Exec[] = before ? [{ shell: before }] : [];
+    /* Found by asking the PATH, so a tool installed but not on it reads as absent: say both. */
     const missing = (tool: string, why = "") =>
-      ({ target, ok: false, why: `needs ${tool}${why}` }) as Planned;
+      ({ target, ok: false, why: `needs ${tool}${why}, on the PATH this command sees` }) as Planned;
+    /*
+      Python for any system from any system: the target's own CPython, its
+      wheels and the program, in one archive. Needs uv, or Python with pip to
+      fetch uv; a dependency with no wheel for the target is the one thing it
+      cannot do, and it says which.
+    */
+    const portable = (): Planned | null =>
+      tools.uv || tools.python
+        ? {
+            target, ok: true, route: native ? "native" : "cross", out,
+            how: `portable CPython for ${target} + its wheels (uv), as a tar.gz with a launcher`,
+            steps: [...pre, { portablePython: { target, out: outAbs } }],
+          }
+        : null;
 
     switch (project.preset) {
       case "go": {
@@ -494,6 +521,27 @@ export function planBuild(project: Project, host: Host, tools: Tools, targets: T
             steps: [...pre, { program: process.execPath, args: [path.join(project.folder, "node_modules", "electron-builder", "cli.js"), ...builder.slice(1), outputFlag(out)] }],
           };
         }
+        /*
+          Linux from Windows needs no container. electron-builder packages a
+          Linux app on Windows by itself; what it cannot do is mark anything
+          executable, because Windows has no such bit, so every program in
+          the archive arrives as a plain file. The archive is fixed up after.
+          A tar.gz only: AppImage needs symlinks and Linux tools, deb needs fpm.
+        */
+        if (os_ === "linux" && host.os === "windows") {
+          return {
+            target, ok: true, route: "cross", out,
+            how: `electron-builder --linux tar.gz --${arch} on Windows, executables marked afterwards (AppImage and deb need Linux)`,
+            steps: [
+              ...pre,
+              {
+                program: process.execPath,
+                args: [path.join(project.folder, "node_modules", "electron-builder", "cli.js"), "--linux", "tar.gz", `--${arch}`, "--publish", "never", ...extra, outputFlag(out)],
+              },
+              { fixTarModes: outAbs },
+            ],
+          };
+        }
         const nativeOk = sameOs || (os_ === "windows" && host.os !== "windows" && tools.wine);
         if (nativeOk) {
           return {
@@ -529,7 +577,7 @@ export function planBuild(project: Project, host: Host, tools: Tools, targets: T
             ? ["--noconfirm", "--distpath", dist, "--workpath", workDir, ...extra, project.entry!]
             : ["--noconfirm", "--onefile", "--name", `${project.name}-${target}`, "--distpath", dist, "--workpath", workDir, "--specpath", specDir, ...extra, project.entry!];
         if (native) {
-          if (!tools.pyinstaller) return missing("PyInstaller (pip install pyinstaller)");
+          if (!tools.pyinstaller) return portable() ?? missing("PyInstaller (pip install pyinstaller)");
           return {
             target, ok: true, route: "native", out, how: "pyinstaller",
             steps: [...pre, { program: "pyinstaller", args: flags(outAbs, path.join(project.folder, work), path.join(project.folder, "build", "coderook")) }],
@@ -553,9 +601,13 @@ export function planBuild(project: Project, host: Host, tools: Tools, targets: T
               steps: [{ program: "wsl", args: ["-e", "sh", "-lc", inner] }],
             };
           }
-          return { target, ok: false, why: `PyInstaller builds only for the system it runs on; needs Docker running, or WSL with PyInstaller, or ${NEEDS("linux")}` };
+          return portable() ?? { target, ok: false, why: `PyInstaller builds only for the system it runs on; needs Docker running, or WSL with PyInstaller, or ${NEEDS("linux")}` };
         }
-        return { target, ok: false, why: `PyInstaller builds only for the system it runs on; ${NEEDS(os_)}` };
+        return portable() ?? { target, ok: false, why: `PyInstaller builds only for the system it runs on; ${NEEDS(os_)}` };
+      }
+      case "python": {
+        if (!project.entry) return { target, ok: false, why: `no entry point; set "entry" in ${CONFIG_FILE}` };
+        return portable() ?? missing("uv, or Python with pip (https://docs.astral.sh/uv)");
       }
       case "custom": {
         if (!project.config.command) return { target, ok: false, why: `"custom" needs a "command" in ${CONFIG_FILE}` };
@@ -592,6 +644,55 @@ function output(program: string, args: string[]): Promise<string | null> {
     child.on("error", () => done(null));
     child.on("exit", (code) => done(code === 0 ? text.trim() : null));
   });
+}
+
+/**
+ * Mark the programs in a tar archive executable: Linux ELF binaries and
+ * scripts with a `#!` line. Each entry's mode is rewritten in its header and
+ * the header checksum recomputed; nothing else in the archive moves.
+ */
+export function markExecutables(archive: Buffer): { archive: Buffer; marked: string[] } {
+  const out = Buffer.from(archive);
+  const marked: string[] = [];
+  let at = 0;
+  while (at + 512 <= out.length) {
+    const header = out.subarray(at, at + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const field = (start: number, length: number) =>
+      header.subarray(start, start + length).toString("utf8").replace(/\0.*$/s, "");
+    const size = parseInt(field(124, 12).trim() || "0", 8);
+    const type = String.fromCharCode(header[156] ?? 48);
+    const body = out.subarray(at + 512, at + 512 + Math.min(size, 4));
+    const program =
+      (body[0] === 0x7f && body.toString("latin1", 1, 4) === "ELF") || body.toString("latin1", 0, 2) === "#!";
+    if ((type === "0" || type === "\0") && program) {
+      const mode = parseInt(field(100, 8).trim() || "0", 8);
+      const wanted = mode | 0o755;
+      if (wanted !== mode) {
+        header.write(`${wanted.toString(8).padStart(7, "0")}\0`, 100, 8, "latin1");
+        header.fill(0x20, 148, 156);
+        let sum = 0;
+        for (const byte of header) sum += byte;
+        header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8, "latin1");
+        const prefix = field(345, 155);
+        marked.push(prefix ? `${prefix}/${field(0, 100)}` : field(0, 100));
+      }
+    }
+    at += 512 + Math.ceil(size / 512) * 512;
+  }
+  return { archive: out, marked };
+}
+
+async function fixTarModes(folder: string): Promise<number> {
+  for (const name of await readdir(folder).catch(() => [] as string[])) {
+    if (!name.endsWith(".tar.gz")) continue;
+    const file = path.join(folder, name);
+    const { archive, marked } = markExecutables(gunzipSync(await readFile(file)));
+    if (!marked.length) continue;
+    await writeFile(file, gzipSync(archive, { level: 9 }));
+    console.log(dim(`Marked ${marked.length} program${marked.length === 1 ? "" : "s"} executable in ${name}.`));
+  }
+  return 0;
 }
 
 /** The one file at `name` in a tar archive, read without unpacking the rest. */
@@ -641,8 +742,34 @@ async function fetchBunRuntime(target: Target, to: string): Promise<number> {
   }
 }
 
+/** The project being built, for the steps that need more than a command line. */
+let building: Project | null = null;
+
+async function runPortable(step: { target: Target; out: string }): Promise<number> {
+  if (!building?.entry) return 1;
+  try {
+    await buildPortablePython({
+      folder: building.folder,
+      target: step.target as PyTarget,
+      name: building.name,
+      entry: building.entry,
+      ...(building.config.python ? { python: building.config.python } : {}),
+      ...(building.config.gui ? { gui: true } : {}),
+      outFolder: step.out,
+      cache: cacheDirectory(),
+      say: (text) => console.log(dim(text)),
+    });
+    return 0;
+  } catch (error) {
+    console.error(red(error instanceof Error ? error.message : String(error)));
+    return 1;
+  }
+}
+
 function run(step: Exec, cwd: string): Promise<number> {
+  if ("portablePython" in step) return runPortable(step.portablePython);
   if ("bunRuntime" in step) return fetchBunRuntime(step.bunRuntime.target, step.bunRuntime.to);
+  if ("fixTarModes" in step) return fixTarModes(step.fixTarModes);
   if ("copy" in step) {
     return (async () => {
       try {
@@ -711,8 +838,8 @@ export async function commandBuild(parsed: Parsed): Promise<number> {
   if (typeof presetFlag === "string") project = { ...project, preset: presetFlag as Preset };
   if (!project.preset) {
     console.error(red("No toolchain recognised in this folder."));
-    console.error(dim(`  Looked for go.mod, Cargo.toml, a .csproj, electron-builder, deno.json, a Bun lockfile and a PyInstaller .spec.`));
-    console.error(dim(`  Say which with ${accent("--preset <go|bun|deno|rust|dotnet|electron|pyinstaller>")}, or describe it in ${CONFIG_FILE} (${accent("cbx build init")}).`));
+    console.error(dim(`  Looked for go.mod, Cargo.toml, a .csproj, electron-builder, deno.json, a Bun lockfile, a PyInstaller .spec and Python files.`));
+    console.error(dim(`  Say which with ${accent("--preset <go|bun|deno|rust|dotnet|electron|pyinstaller|python>")}, or describe it in ${CONFIG_FILE} (${accent("cbx build init")}).`));
     return 1;
   }
 
@@ -729,6 +856,7 @@ export async function commandBuild(parsed: Parsed): Promise<number> {
     return 1;
   }
 
+  building = project;
   const host = thisHost();
   console.log(dim(`Checking what this ${host.os} ${host.arch} machine can build with…`));
   const tools = await detectTools(host);
