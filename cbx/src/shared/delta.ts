@@ -369,6 +369,111 @@ function encodePatchV2(targetSize: number, operations: DeltaOperation[]): Uint8A
   return out;
 }
 
+/* Bytes a run must share with the base before it is worth a COPY over a literal. */
+const EXACT_MIN_COPY = 12;
+const EXACT_WINDOW = 16;
+
+function windowKey(bytes: Uint8Array, at: number): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < EXACT_WINDOW; index += 1) {
+    hash = Math.imul(hash ^ (bytes[at + index] ?? 0), 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Build a V2 patch from the base bytes themselves, for a client that still
+ * holds the version it is editing, the way Git's sender holds the objects the
+ * receiver has. No signature is fetched, and copies start and end on any
+ * byte, so a one-byte edit costs a few bytes instead of a whole block.
+ *
+ * The result is the same CRP2 format the receiver-signature path produces:
+ * any service that applies those applies this, and verifies the digest after.
+ */
+export function createExactDeltaPatch(
+  base: Uint8Array,
+  target: Uint8Array,
+  /* The transport's limit unless said; a local history keeps larger pieces as deltas too. */
+  maxBytes = DELTA_MAX_FILE_BYTES,
+): Uint8Array {
+  if (target.byteLength > maxBytes || base.byteLength > maxBytes) {
+    throw new Error("Delta target exceeds the bounded transport limit");
+  }
+  const operations: DeltaOperation[] = [];
+  /* The common case is one edited region: keep both ends whole. */
+  const limit = Math.min(base.byteLength, target.byteLength);
+  let prefix = 0;
+  while (prefix < limit && base[prefix] === target[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < limit - prefix &&
+    base[base.byteLength - 1 - suffix] === target[target.byteLength - 1 - suffix]
+  ) suffix += 1;
+  if (prefix >= EXACT_MIN_COPY) appendOperation(operations, { kind: "copy", offset: 0, length: prefix });
+  else prefix = 0;
+  if (suffix < EXACT_MIN_COPY) suffix = 0;
+
+  const baseEnd = base.byteLength - suffix;
+  const targetEnd = target.byteLength - suffix;
+  /* Every window of the base's middle, by the offset it starts at. */
+  const index = new Map<number, number[]>();
+  /*
+    Every offset for a small middle; every sixteenth past 256 KiB, as Git's
+    delta indexes, so an 8 MiB base is half a million entries, not eight
+    million. The target is still scanned at every byte, so moved text is found.
+  */
+  const middle = baseEnd - prefix;
+  const stride = middle > 8 * 1024 * 1024 ? EXACT_WINDOW * 4 : middle > 256 * 1024 ? EXACT_WINDOW : 1;
+  for (let at = prefix; at + EXACT_WINDOW <= baseEnd; at += stride) {
+    const key = windowKey(base, at);
+    const list = index.get(key);
+    if (!list) index.set(key, [at]);
+    else if (list.length < 16) list.push(at);
+  }
+  let cursor = prefix;
+  let literalStart = prefix;
+  while (cursor + EXACT_WINDOW <= targetEnd) {
+    const candidates = index.get(windowKey(target, cursor));
+    let bestOffset = -1;
+    let bestLength = 0;
+    let bestBack = 0;
+    for (const offset of candidates ?? []) {
+      let length = 0;
+      while (
+        cursor + length < targetEnd &&
+        offset + length < baseEnd &&
+        base[offset + length] === target[cursor + length]
+      ) length += 1;
+      let back = 0;
+      while (
+        back < cursor - literalStart &&
+        back < offset - prefix &&
+        base[offset - back - 1] === target[cursor - back - 1]
+      ) back += 1;
+      if (length + back > bestLength + bestBack) {
+        bestOffset = offset;
+        bestLength = length;
+        bestBack = back;
+      }
+    }
+    if (bestOffset >= 0 && bestLength + bestBack >= EXACT_MIN_COPY) {
+      appendOperation(operations, { kind: "literal", bytes: target.slice(literalStart, cursor - bestBack) });
+      appendOperation(operations, {
+        kind: "copy",
+        offset: bestOffset - bestBack,
+        length: bestLength + bestBack,
+      });
+      cursor += bestLength;
+      literalStart = cursor;
+      continue;
+    }
+    cursor += 1;
+  }
+  appendOperation(operations, { kind: "literal", bytes: target.slice(literalStart, targetEnd) });
+  if (suffix) appendOperation(operations, { kind: "copy", offset: baseEnd, length: suffix });
+  return encodePatchV2(target.byteLength, operations);
+}
+
 /** Build COPY/INSERT operations from receiver signatures, without base bytes. */
 export function createDeltaPatch(
   target: Uint8Array,
@@ -471,9 +576,14 @@ export function deltaPatchTargetSize(patch: Uint8Array): number {
   return size;
 }
 
-export function applyDeltaPatch(base: Uint8Array, patch: Uint8Array): Uint8Array {
+export function applyDeltaPatch(
+  base: Uint8Array,
+  patch: Uint8Array,
+  /* The transport's limit unless said; see createExactDeltaPatch. */
+  maxBytes = DELTA_MAX_FILE_BYTES,
+): Uint8Array {
   if (sameMagic(patch, PATCH_MAGIC_V2)) {
-    return applyDeltaPatchV2(base, patch);
+    return applyDeltaPatchV2(base, patch, maxBytes);
   }
   if (
     patch.byteLength < PATCH_HEADER_V1_BYTES ||
@@ -537,12 +647,12 @@ export function applyDeltaPatch(base: Uint8Array, patch: Uint8Array): Uint8Array
   return out;
 }
 
-function applyDeltaPatchV2(base: Uint8Array, patch: Uint8Array): Uint8Array {
+function applyDeltaPatchV2(base: Uint8Array, patch: Uint8Array, maxBytes = DELTA_MAX_FILE_BYTES): Uint8Array {
   const targetField = readVarUint(patch, 4);
   const targetSize = targetField.value;
   const countField = readVarUint(patch, targetField.next);
   const operationCount = countField.value;
-  if (targetSize > DELTA_MAX_FILE_BYTES || operationCount > 1_000_000) {
+  if (targetSize > maxBytes || operationCount > 1_000_000) {
     throw new Error("Delta patch dimensions are invalid");
   }
   const out = new Uint8Array(targetSize);

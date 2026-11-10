@@ -209,6 +209,87 @@ test("cbx link connects the folder on purpose, and a second link is refused", as
   }
 });
 
+test("cbx link stands on the head of the line after an undo, not the newest version", async () => {
+  /* v42 was passed over by `cbx undo`: main is back on v41 and v42 is still in the history. */
+  const V41 = "9a8b7c6d-0000-4000-8000-000000000041";
+  const V42 = "9a8b7c6d-0000-4000-8000-000000000042";
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    const reply = (status: number, value: unknown) => {
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(value));
+    };
+    if (request.url === "/v1/repositories") return reply(200, { repositories: [row("night-shift")] });
+    if (request.url === `/v1/repositories/${PROJECT}/versions`) {
+      return reply(200, {
+        versions: [
+          { id: V42, sequence: 42, state: "verified", createdAt: "2026-10-10T02:00:00Z" },
+          { id: V41, sequence: 41, state: "verified", createdAt: "2026-10-10T01:00:00Z" },
+        ],
+      });
+    }
+    if (request.url === `/v1/repositories/${PROJECT}/tracks`) {
+      return reply(200, { tracks: [{ id: "t-main", name: "main", kind: "line", headVersionId: V41 }] });
+    }
+    if (request.url === `/v1/repositories/${PROJECT}/versions/${V41}/files`) {
+      return reply(200, { files: [{ path: "main.js", sha256: SHA, sourceSize: 1 }] });
+    }
+    return reply(404, { error: { message: "not here" } });
+  });
+  await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const folder = folderNamed("night-shift");
+    const result = await run(origin, folder, ["link", "night-shift"]);
+    assert.equal(result.code, 0, result.out);
+    assert.match(result.out, /at v41/);
+    const link = await readLink(folder);
+    assert.equal(link?.baseVersionId, V41);
+  } finally {
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+});
+
+test("cbx release names the head of the line after an undo, not the version it passed over", async () => {
+  const V2 = "9a8b7c6d-0000-4000-8000-000000000002";
+  const V3 = "9a8b7c6d-0000-4000-8000-000000000003";
+  const released: string[] = [];
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    const reply = (status: number, value: unknown) => {
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(value));
+    };
+    if (request.url === "/v1/repositories") return reply(200, { repositories: [row("lap-timer")] });
+    if (request.url === `/v1/repositories/${PROJECT}/versions`) {
+      return reply(200, {
+        versions: [
+          { id: V3, sequence: 3, state: "verified", message: "Speed up the timer", createdAt: "2026-10-11T02:00:00Z" },
+          { id: V2, sequence: 2, state: "verified", message: "Add best lap", createdAt: "2026-10-11T01:00:00Z" },
+        ],
+      });
+    }
+    if (request.url === `/v1/repositories/${PROJECT}/tracks`) {
+      return reply(200, { tracks: [{ id: "t-main", name: "main", kind: "line", headVersionId: V2 }] });
+    }
+    const release = request.url?.match(/\/versions\/([^/]+)\/release$/);
+    if (request.method === "PUT" && release) {
+      released.push(release[1]!);
+      return reply(200, { release: { name: "v1.0", versionId: release[1] } });
+    }
+    return reply(404, { error: { message: "not here" } });
+  });
+  await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const folder = folderNamed("lap-timer");
+    const result = await run(origin, folder, ["release", "v1.0", "lap-timer"]);
+    assert.equal(result.code, 0, result.out);
+    assert.deepEqual(released, [V2]);
+    assert.match(result.out.replace(/\x1b\[[0-9;]*m/g, ""), /at v2/);
+  } finally {
+    await new Promise<void>((done) => server.close(() => done()));
+  }
+});
+
 test("an unlinked folder stays unlinked after status", async () => {
   const api = await service();
   const folder = folderNamed("voxai-coder");

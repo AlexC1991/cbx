@@ -18,8 +18,13 @@
  * decision somebody made rather than one they discovered.
  */
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
+import {redactRunOutput, RunOutputStream, credentialArtifactPath, artifactContainsSecret} from "../../cbx/src/shared/run_output.js";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, mkdir, chmod, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +35,8 @@ import { apiOrigin, credentials, loadToken } from "./config.js";
 import { RunProgress } from "./progress.js";
 
 export type ClaimedRun = {
+  workspaceInput?: boolean;
+  artifactsAllowed?: boolean;
   runId: string;
   number: number;
   workflowId: string;
@@ -41,7 +48,18 @@ export type ClaimedRun = {
   attempts: number;
   /** Paths this run is expected to hand back, relative to the checkout. */
   artifactPaths?: string[];
+  /** CODEROOK_* variables, matrix values and the project's secrets, handed to the command. */
+  environment?: Record<string, string>;
+  /** Which of those are secret: their values are replaced by *** before anything is shown or sent. */
+  secretNames?: string[];
+  /** The workflow's own time limit, when it set one. */
+  timeoutMinutes?: number | null;
 };
+
+/** Replace each secret's value with ***, longest first. */
+export function maskSecrets(text: string, secrets: string[]): string {
+  return redactRunOutput(text, secrets);
+}
 
 /** How often to tell the service the machine is still working. */
 const HEARTBEAT_MS = 30_000;
@@ -75,9 +93,9 @@ async function call<T>(
   const text = await response.text();
   const body = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(
-      body?.error?.message ?? `${route} failed (${response.status})`,
-    );
+    const error = new Error(body?.error?.message ?? `${route} failed (${response.status})`) as Error & { code?: string };
+    error.code = body?.error?.code;
+    throw error;
   }
   return body as T;
 }
@@ -152,14 +170,15 @@ class LogShipper {
  * the run log, which read access is enough to see — so a collaborator could
  * walk off with the account of whoever was hosting the runner.
  *
- * The rest of the environment is left alone. PATH, HOME and the compiler
- * settings are what makes a build possible, and stripping them would break
- * every real workflow to guard against a risk the runner already announces.
+ * Only platform and toolchain variables are inherited. The command gets a
+ * temporary HOME, npm configuration and cache inside the job folder. This
+ * prevents accidental inheritance; a native runner is still trusted code on
+ * its host, not a filesystem or network sandbox.
  */
 export function withoutCredentials(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const safe: NodeJS.ProcessEnv = { ...source };
   for (const name of Object.keys(safe)) {
-    if (/^CODEROOK_(TOKEN|SECRET|PASSWORD|API_KEY)$/i.test(name)) {
+    if (!/^(?:PATH|PATHEXT|SYSTEMROOT|WINDIR|COMSPEC|TEMP|TMP|HOME|USERPROFILE|LANG|LC_[A-Z_]+|TERM|COLORTERM|NUMBER_OF_PROCESSORS|PROCESSOR_ARCHITECTURE|JAVA_HOME|DOTNET_ROOT|CARGO_HOME|RUSTUP_HOME|GOROOT|GOPATH)$/i.test(name)) {
       delete safe[name];
     }
   }
@@ -248,12 +267,15 @@ export async function uploadArtifacts(
   workspace: string,
   patterns: string[],
   say: (line: string) => void,
+  secrets: string[] = [],
 ): Promise<number> {
   const wanted = await collectArtifacts(workspace, patterns);
   let kept = 0;
   for (const file of wanted) {
     try {
+      if (credentialArtifactPath(file.relative)) { say("Skipped an authentication/configuration artifact"); continue; }
       const bytes = await readFile(file.absolute);
+      if (artifactContainsSecret(bytes, secrets)) { say("Skipped an artifact containing credential material"); continue; }
       const digest = createHash("sha256").update(bytes).digest("hex");
       const token = await loadToken();
       const stored = await fetch(
@@ -376,10 +398,33 @@ export async function performRun(
   repositoryId: string,
   run: ClaimedRun,
   runner: string,
-): Promise<{ status: "passed" | "failed"; summary: string }> {
+): Promise<{ status: "passed" | "failed" | "cancelled"; summary: string }> {
   const progress = new RunProgress();
+  /* Set when somebody cancels the run on CodeRook: the work stops now rather than when it ends. */
+  let cancelled = false;
+  /* Set when the workflow's time limit passes on this machine. */
+  let timedOut = false;
+  let limitTimer: NodeJS.Timeout | undefined;
+  const secrets = (run.secretNames ?? [])
+    .map((name) => run.environment?.[name] ?? "")
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  let child: ReturnType<typeof spawn> | null = null;
+  const stopChild = () => {
+    if (!child?.pid || child.exitCode !== null) return;
+    if (process.platform === "win32") {
+      /* The command runs through a shell; the whole tree goes, not only the shell. */
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        child.kill("SIGTERM");
+      }
+    }
+  };
   const logs = new LogShipper(repositoryId, run.runId, (line) =>
-    progress.say(line),
+    progress.say(maskSecrets(line, secrets)),
   );
   const started = Date.now();
   const workspace = await mkdtemp(path.join(tmpdir(), "coderook-run-"));
@@ -391,17 +436,40 @@ export async function performRun(
       void call(`/v1/repositories/${repositoryId}/runs/${run.runId}/heartbeat`, {
         method: "POST",
         body: { runner },
-      }).catch(() => {
+      }).catch((error: { code?: string }) => {
         /*
-          A lost lease means the service has given this run to somebody else,
-          and the local process is now doing work nobody will accept. Stopping
-          the heartbeat is enough: the report at the end will be refused too,
-          and the run that matters is the one the other machine is doing.
+          Cancelled: end the work now. A lost lease otherwise means the service
+          has given this run to somebody else, and the local process is doing
+          work nobody will accept; the report at the end changes nothing, and
+          the run that matters is the one the other machine is doing.
         */
+        if (error?.code === "run_cancelled" && !cancelled) {
+          cancelled = true;
+          logs.add("Cancelled on CodeRook. Stopping.", "stderr");
+          stopChild();
+        }
       });
     }, HEARTBEAT_MS);
 
-    if (run.versionId) {
+    if (run.workspaceInput) {
+      const input=await call<{workspaceId:string;revision:number;command:string;workingDirectory:string|null;artifactPaths:string[];files:Array<{index:number;path:string;size:number;sha256:string;executable:boolean}>}>(`/v1/repositories/${repositoryId}/workspace-runs/${run.runId}/input`);
+      run.command=input.command;run.workingDirectory=input.workingDirectory;run.artifactPaths=input.artifactPaths;
+      logs.add(`Fetching ${input.files.length} selected files from frozen workspace revision ${input.revision}…`,'stdout');
+      const token=await loadToken();
+      for(const file of input.files){
+        if(cancelled)throw new Error('Cancelled while fetching workspace input');
+        if(!/^[a-f0-9]{64}$/.test(file.sha256??''))throw new Error(`The frozen file ${file.path} has no verified content digest`);
+        const destination=insideWorkspace(workspace,file.path);await mkdir(path.dirname(destination),{recursive:true});
+        const response=await fetch(`${apiOrigin()}/v1/repositories/${repositoryId}/workspace-runs/${run.runId}/input/${file.index}`,{headers:{authorization:`Bearer ${token}`,...clientHeaders()},signal:AbortSignal.timeout(REQUEST_DEADLINE_MS)});
+        if(!response.ok||!response.body)throw new Error(`Could not fetch frozen workspace file ${file.path} (${response.status})`);
+        const hash=createHash('sha256');let bytes=0;
+        const verify=new Transform({transform(chunk:Buffer,_encoding,callback){bytes+=chunk.length;if(bytes>file.size){callback(new Error('Frozen workspace file exceeds its declared size'));return;}hash.update(chunk);callback(null,chunk);}});
+        await pipeline(Readable.fromWeb(response.body as never),verify,createWriteStream(destination));
+        if(bytes!==file.size||hash.digest('hex')!==file.sha256)throw new Error(`Frozen content verification failed for ${file.path}; credential-bearing source must use separately configured credentials`);
+        if(file.executable&&process.platform!=='win32')await chmod(destination,0o755);
+      }
+      logs.add('Selected workspace inputs verified.','stdout');
+    } else if (run.versionId) {
       logs.add(`Fetching v${run.versionSequence ?? "?"}…`, "stdout");
       /*
         The one phase that knows its own size. The version says how many files
@@ -437,7 +505,14 @@ export async function performRun(
       ? insideWorkspace(workspace, run.workingDirectory)
       : workspace;
 
-    progress.step("Running", command);
+    progress.step("Running", maskSecrets(command, secrets));
+    // npm and other tools must not automatically reuse the runner owner's login files.
+    const home = path.join(workspace, ".run-home");
+    await mkdir(home, {recursive:true});
+    const temporary = path.join(home, "tmp");
+    await mkdir(temporary, {recursive:true});
+    const emptyConfig = path.join(home, "empty.npmrc");
+    await writeFile(emptyConfig, "", {mode:0o600});
     flushing = setInterval(() => void logs.flush(), FLUSH_MS);
 
     const code = await new Promise<number>((settle) => {
@@ -447,11 +522,28 @@ export async function performRun(
         Which shell is the platform's own, so a Windows machine reads it the
         way a Windows user wrote it.
       */
-      const child = spawn(command, {
+      if (cancelled) {
+        settle(1);
+        return;
+      }
+      child = spawn(command, {
         cwd: directory,
         shell: true,
+        /* Its own process group off Windows, so cancelling can stop everything it started. */
+        detached: process.platform !== "win32",
         env: {
           ...withoutCredentials(process.env),
+          ...(run.environment ?? {}),
+          HOME: home,
+          USERPROFILE: home,
+          TEMP: temporary,
+          TMP: temporary,
+          TMPDIR: temporary,
+          XDG_CONFIG_HOME: path.join(home, ".config"),
+          XDG_CACHE_HOME: path.join(home, ".cache"),
+          NPM_CONFIG_USERCONFIG: emptyConfig,
+          NPM_CONFIG_GLOBALCONFIG: emptyConfig,
+          NPM_CONFIG_CACHE: path.join(home, ".npm-cache"),
           CI: "true",
           CODEROOK_RUN: String(run.number),
           CODEROOK_VERSION: run.versionSequence
@@ -464,19 +556,29 @@ export async function performRun(
         a failed run can be read later; the person watching needs it so they
         can tell a slow build from a stuck one.
       */
-      const tee = (chunk: Buffer, stream: "stdout" | "stderr") => {
-        const text = chunk.toString("utf8");
-        logs.add(text, stream);
-        progress.say(text);
-      };
+      const decoders = {stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8")};
+      const protectedStreams = {stdout: new RunOutputStream(secrets), stderr: new RunOutputStream(secrets)};
+      const show = (text: string, stream: "stdout" | "stderr") => { if (text) { logs.add(text, stream); progress.say(text); } };
+      const tee = (chunk: Buffer, stream: "stdout" | "stderr") => show(protectedStreams[stream].push(decoders[stream].write(chunk)), stream);
+      const finishOutput = () => { for (const stream of ["stdout", "stderr"] as const) {
+        show(protectedStreams[stream].push(decoders[stream].end()) + protectedStreams[stream].end(), stream);
+      }};
       child.stdout?.on("data", (chunk: Buffer) => tee(chunk, "stdout"));
       child.stderr?.on("data", (chunk: Buffer) => tee(chunk, "stderr"));
       child.on("error", (error) => {
-        logs.add(errorText(error), "stderr");
+        logs.add(maskSecrets(errorText(error), secrets), "stderr");
         settle(1);
       });
-      child.on("close", (status) => settle(status ?? 1));
+      child.on("close", (status) => { finishOutput(); settle(status ?? 1); });
+      if (run.timeoutMinutes) {
+        limitTimer = setTimeout(() => {
+          timedOut = true;
+          logs.add(`Stopped: past this workflow's time limit of ${run.timeoutMinutes} minutes.`, "stderr");
+          stopChild();
+        }, run.timeoutMinutes * 60_000);
+      }
     });
+    if (limitTimer) clearTimeout(limitTimer);
 
     /*
       What it built, before the folder goes.
@@ -485,7 +587,7 @@ export async function performRun(
       very log or partial output somebody needs to work out why, and throwing
       that away is exactly when they would have wanted it.
     */
-    if (run.artifactPaths?.length) {
+    if (run.artifactPaths?.length && (run.artifactsAllowed ?? !run.secretNames?.length)) {
       progress.step("Keeping what it built");
       const kept = await uploadArtifacts(
         repositoryId,
@@ -493,34 +595,46 @@ export async function performRun(
         workspace,
         run.artifactPaths,
         (line) => {
-          logs.add(line, "stdout");
-          progress.say(line);
+          logs.add(maskSecrets(line, secrets), "stdout");
+          progress.say(maskSecrets(line, secrets));
         },
+        secrets,
       );
       if (!kept) {
         logs.add("Nothing matched the paths this workflow keeps.", "stdout");
       }
     }
 
+    if (run.artifactPaths?.length && !(run.artifactsAllowed ?? !run.secretNames?.length)) logs.add("Artifacts disabled for this credential-capable run; use a separate credential-free build job.", "stdout");
     await logs.flush();
     const seconds = Math.round((Date.now() - started) / 1000);
+    if (timedOut) return { status: "failed", summary: `Stopped after its time limit of ${run.timeoutMinutes} minutes` };
+    if (cancelled) return { status: "cancelled", summary: `Cancelled after ${seconds}s` };
     return code === 0
       ? { status: "passed", summary: `Passed in ${seconds}s` }
       : { status: "failed", summary: `Exited ${code} after ${seconds}s` };
   } catch (error) {
-    logs.add(errorText(error), "stderr");
+    const safeError = maskSecrets(errorText(error), secrets);
+    logs.add(safeError, "stderr");
     await logs.flush();
-    return { status: "failed", summary: errorText(error).slice(0, 200) };
+    return { status: "failed", summary: safeError.slice(0, 200) };
   } finally {
     /*
       Before anything else. A spinner still repainting while the last flush
       goes out would overwrite the verdict the caller is about to print.
     */
     progress.done();
+    if (limitTimer) clearTimeout(limitTimer);
     if (beating) clearInterval(beating);
     if (flushing) clearInterval(flushing);
     await logs.flush();
-    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    await rm(workspace, { recursive: true, force: true, maxRetries:3, retryDelay:100 }).catch(async () => {
+      const summary="Runner cleanup failed. Stop this runner and remove its temporary job folder before processing more credential-bearing work.";
+      // Report a final failure before stopping the runner, rather than leaving
+      // a completed publish queued for a lease-expiry retry.
+      await report(repositoryId,run.runId,{status:"failed",summary},Date.now()-started).catch(()=>undefined);
+      throw new Error(summary);
+    });
   }
 }
 
@@ -528,7 +642,7 @@ export async function performRun(
 export async function report(
   repositoryId: string,
   runId: string,
-  verdict: { status: "passed" | "failed"; summary: string },
+  verdict: { status: "passed" | "failed" | "cancelled"; summary: string },
   durationMs: number,
 ): Promise<void> {
   await call(`/v1/repositories/${repositoryId}/runs/${runId}`, {

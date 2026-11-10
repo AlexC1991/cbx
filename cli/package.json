@@ -1,6 +1,6 @@
 {
   "name": "@coderook/cli",
-  "version": "0.34.1",
+  "version": "0.46.3",
   "description": "The command line for CodeRook (coderook.com): version control and project hosting for projects of any size. Every save is a compressed snapshot, private or public, never used to train AI.",
   "license": "Apache-2.0",
   "homepage": "https://coderook.com",
@@ -23,12 +23,13 @@
     "node": ">=22.15.0"
   },
   "bin": {
-    "cbx": "dist/cli/src/cli.js",
-    "coderook": "dist/cli/src/cli.js",
+    "cbx": "dist/cli/src/bin.js",
+    "coderook": "dist/cli/src/bin.js",
     "git-remote-coderook": "dist/cli/src/git_remote_bin.js"
   },
   "files": [
     ".claude-plugin",
+    "engine-bin",
     "dist",
     "skills",
     "NOTICE"
@@ -52,7 +53,9 @@
     "test:race": "node test/race-attempts.mjs",
     "test:runner": "node test/runner-live.mjs",
     "sync:plugin": "node scripts/sync-plugin-version.mjs",
-    "test:track": "node test/get-track.mjs"
+    "test:track": "node test/get-track.mjs",
+    "package:remote": "node ../scripts/package-cli-release.mjs",
+    "publish:remote": "node ../scripts/publish-cli-release.mjs"
   },
   "devDependencies": {
     "@types/node": "24.10.1",

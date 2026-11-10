@@ -32,15 +32,11 @@ import path from "node:path";
 import process from "node:process";
 
 import type { Parsed } from "./registry.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
 /* Written out rather than imported: the same four escapes every other command
    file in here declares for itself, and a shared module for four one-line
    functions would be the only thing they all depend on. */
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
 
 /**
  * Which of `[n] [project]` the arguments actually were.

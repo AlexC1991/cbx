@@ -237,3 +237,45 @@ test("off Windows, a sent file's own mode says whether it runs", { skip: process
   });
   assert.equal(seen.published.find((one) => one.path === changed)?.executable, true);
 });
+
+/*
+  Moved, renamed or copied: the same bytes at a new path.
+
+  Reuse used to need the same path as well as the same bytes, so renaming a
+  folder sent every file in it again. Found by renaming one folder of 2,192
+  files in a copy of the Cheat Engine sources: 5.5 MB re-sent to record bytes
+  the project already held as slices of a pack.
+*/
+test("a renamed folder sends nothing and names the slices it already has", async () => {
+  const { seen, result } = await save(
+    async (folder) => {
+      const { rename } = await import("node:fs/promises");
+      await rename(path.join(folder, "src"), path.join(folder, "source"));
+    },
+    Object.keys(BASE),
+  );
+  assert.equal(seen.putBodies, 0, `${seen.putBodies} files sent for a rename`);
+  assert.equal(seen.quoted.length, 0);
+  assert.equal(Object.keys(result.manifest).length, 40);
+  /* And this folder knows it holds them, or status calls every one "behind". */
+  const local = result.local as Record<string, string>;
+  for (const [file, body] of Object.entries(BASE)) {
+    assert.equal(local[file.replace(/^src\//, "source/")], sha(body), `${file} not recorded as held`);
+  }
+  for (const one of seen.published) {
+    assert.ok(String(one.path).startsWith("source/"), `${String(one.path)} kept its old path`);
+    const pack = one.pack as { packObjectId?: string; objectId?: string } | undefined;
+    assert.equal(pack?.packObjectId ?? pack?.objectId, "pack-base");
+  }
+});
+
+test("a copy of a file the project holds is named, not sent", async () => {
+  const { seen } = await save(async (folder) => {
+    await mkdir(path.join(folder, "backup"), { recursive: true });
+    await writeFile(path.join(folder, "backup", "file-07 copy.md"), BASE[changed]!);
+  });
+  assert.equal(seen.putBodies, 0);
+  const copy = seen.published.find((one) => one.path === "backup/file-07 copy.md");
+  assert.ok(copy, "the copy is in the version");
+  assert.equal(copy.mediaType, "text/markdown", "its type comes from its own name");
+});

@@ -39,6 +39,7 @@ import {
   type CredentialFinding,
   worthReading,
 } from "./secret_patterns.js";
+import { engineMeasure, engineScan, worthTheEngine } from "../shared/native_engine.js";
 
 const run = promisify(execFile);
 
@@ -865,6 +866,9 @@ const LINE_COUNT_LIMIT = 4 * 1024 * 1024;
 /** Enough rows for any real project; past it the rail would be unusable. */
 const LISTED_FILE_LIMIT = 20_000;
 
+/** How many files the native engine is handed at once while a scan reads ahead. */
+const READ_AHEAD_FILES = 4_096;
+
 /**
  * What a capped scan could not fit, so the rail can say so.
  *
@@ -1046,10 +1050,18 @@ export async function changedFiles(
   stats?: StatCache,
   /** Filled with how much of the folder the cap allowed through. */
   outcome?: ListingOutcome,
+  /** False for a read-only report: the listing's sizes and times may stand in for a stat (see engineScan). */
+  exact = true,
 ): Promise<ChangedFile[]> {
-  const layers = await collectLayers(root, rules);
   /* What git already tracks goes up whatever a rule says; see gitTracked. */
   const tracked = await gitTracked(root);
+  /*
+    The native engine walks the folder itself when there is one, deciding every
+    rule as this file does and in the same order (engine/compat/rules-cross.mjs
+    compares the two), with one stat per file. Otherwise both passes run here.
+  */
+  const native = await engineScan(root, rules, tracked, baseline?.size ?? stats?.size, exact);
+  const layers = native ? [] : await collectLayers(root, rules);
   const files: ChangedFile[] = [];
   const present = new Set<string>();
   const pending: string[] = [root];
@@ -1076,7 +1088,12 @@ export async function changedFiles(
     costs, so reading is what the cap should govern, and it can only be spent
     well once the whole folder is known.
   */
-  for (let next = 0; next < pending.length; next++) {
+  for (const one of native ?? []) {
+    present.add(one.path);
+    outcome?.sizes.push({ path: one.path, size: one.size });
+    found.push({ full: path.join(root, ...one.path.split("/")), relative: one.path, size: one.size, mtimeMs: one.mtimeMs });
+  }
+  for (let next = 0; !native && next < pending.length; next++) {
     const directory = pending[next]!;
     let entries;
     try {
@@ -1151,15 +1168,60 @@ export async function changedFiles(
     the list is full rather than over a fixed slice — a folder where nothing
     has changed still has to be walked through to find that out.
   */
-  for (const one of spreadAcrossDirectories(found)) {
+  const order = spreadAcrossDirectories(found);
+  /*
+    Read ahead by the native engine, a slice at a time in the same order, when
+    there is enough to read to be worth a process. A slice rather than all of
+    it, so the cap still stops the reading where it stops the list. Whatever
+    the engine does not answer is measured here as before, with the same rules:
+    an unchanged file is not read, nor a large one nothing could match.
+  */
+  const readAhead = new Map<string, { lines: number; binary: boolean; hash: string }>();
+  const needsReading = (one: (typeof found)[number]): boolean => {
+    const cached = stats?.get(one.relative);
+    if (cached && cached.size === one.size && cached.mtimeMs === one.mtimeMs) return false;
+    return one.size <= LINE_COUNT_LIMIT || (baseline?.has(one.relative) ?? false);
+  };
+  let readAheadTo = 0;
+  for (let at = 0; at < order.length; at += 1) {
     if (files.length >= limit) break;
+    if (at >= readAheadTo) {
+      const slice: Array<(typeof found)[number]> = [];
+      let bytes = 0;
+      let next = at;
+      while (next < order.length && slice.length < READ_AHEAD_FILES) {
+        const candidate = order[next]!;
+        if (needsReading(candidate)) {
+          slice.push(candidate);
+          bytes += candidate.size;
+        }
+        next += 1;
+      }
+      readAheadTo = next;
+      if (worthTheEngine(slice.length, bytes)) {
+        const answered = await engineMeasure(
+          root,
+          slice.map((one) => ({ path: one.relative, count: one.size <= LINE_COUNT_LIMIT })),
+        );
+        for (const one of slice) {
+          const got = answered?.get(one.relative);
+          /* Not as listed means it is being written; measured again below. */
+          if (!got?.sha256 || got.error || got.size !== one.size || got.mtimeMs !== one.mtimeMs) continue;
+          readAhead.set(one.relative, { lines: got.lines ?? 0, binary: got.binary ?? true, hash: got.sha256 });
+        }
+      }
+    }
+    const one = order[at]!;
     const { full, relative, size, mtimeMs } = one;
 
-    const measured = await measure(full, size, {
-      mtimeMs,
-      cached: stats?.get(relative),
-      recorded: baseline?.has(relative) ?? false,
-    });
+    const measured =
+      readAhead.get(relative) ??
+      (await measure(full, size, {
+        mtimeMs,
+        cached: stats?.get(relative),
+        recorded: baseline?.has(relative) ?? false,
+      }));
+    readAhead.delete(relative);
     /*
       Remembered whether or not it changed: the next scan wants to skip
       reading this file again, and that is just as true of one that was
@@ -1238,9 +1300,23 @@ export async function surveyFiles(
   */
   onFound?: (found: number) => void,
 ): Promise<Array<{ path: string; size: number }>> {
-  const layers = await collectLayers(root, rules);
   const tracked = await gitTracked(root);
+  /* The native engine's walk, when there is one: the same files, decided the same way. */
+  const native = await engineScan(root, rules, tracked);
+  if (native) {
+    onFound?.(native.length);
+    return native
+      .map((one) => ({ path: one.path, size: one.size }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+  }
+  const layers = await collectLayers(root, rules);
   const found: Array<{ path: string; size: number }> = [];
+  /*
+    Every entry asks about each folder above it; those answers do not change
+    during one walk, so each folder is decided once rather than once per file
+    beneath it.
+  */
+  const folderAnswers: FolderAnswers = new Map();
 
   /*
     A level at a time, eight in flight.
@@ -1273,7 +1349,7 @@ export async function surveyFiles(
 
           if (entry.isDirectory()) {
             if (
-              excludes(relative, true, layers) &&
+              excludes(relative, true, layers, folderAnswers) &&
               !negationReachesInto(relative, layers) &&
               !tracked?.folders.has(relative)
             ) {
@@ -1283,7 +1359,7 @@ export async function surveyFiles(
             continue;
           }
           if (!entry.isFile()) continue;
-          if (excludes(relative, false, layers) && !tracked?.files.has(relative)) continue;
+          if (excludes(relative, false, layers, folderAnswers) && !tracked?.files.has(relative)) continue;
           here.push({ full, relative });
         }
         for (let from = 0; from < here.length; from += WALK_LANES) {
@@ -1799,10 +1875,33 @@ const SECRET_SUFFIXES = [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"];
   the answer be a rule — one line in .gitignore covers the lot, where a list
   of the files inside it would go stale the moment the program ran again.
 */
-const PRIVATE_DIRECTORIES: Array<{ match: RegExp; because: string }> = [
+/** Chromium's disk cache: an index beside data_N blocks, Cache_Data, or the js/wasm code cache. */
+async function looksLikeBrowserCache(directory: string): Promise<boolean> {
+  const names = new Set((await readdir(directory).catch(() => [] as string[])).map((name) => name.toLowerCase()));
+  if (names.has("cache_data") || names.has("index-dir")) return true;
+  if (names.has("index") && names.has("data_0")) return true;
+  return names.has("js") && names.has("wasm");
+}
+
+const PRIVATE_DIRECTORIES: Array<{
+  match: RegExp;
+  because: string;
+  /** When the name alone is not enough: whether what is inside is the private kind. */
+  inside?: (directory: string) => Promise<boolean>;
+}> = [
   {
-    match: /^(Local Storage|Session Storage|IndexedDB|Service Worker|Cache|Code Cache|GPUCache)$/i,
+    match: /^(Local Storage|Session Storage|IndexedDB|Service Worker)$/i,
     because: "a browser profile, which holds the sites you are signed in to",
+  },
+  /*
+    "Cache" is also an ordinary name for source: FreeType keeps ftcache.c in
+    `src/cache`, and a Godot checkout was refused as "a browser profile" for
+    it. So these three only count when what is inside is a browser's cache.
+  */
+  {
+    match: /^(Cache|Code Cache|GPUCache)$/i,
+    because: "a browser profile, which holds the sites you are signed in to",
+    inside: looksLikeBrowserCache,
   },
   { match: /^\.wrangler$/i, because: "local service state, including emulated databases" },
   { match: /^\.aws$/i, because: "cloud credentials" },
@@ -1863,9 +1962,13 @@ export async function detectPrivateDirectories(
       if (isUncounted(entry.name)) continue;
       const full = path.join(directory, entry.name);
       const relative = path.relative(root, full).split(path.sep).join("/");
-      const rule = PRIVATE_DIRECTORIES.find((candidate) =>
-        candidate.match.test(entry.name),
-      );
+      let rule: (typeof PRIVATE_DIRECTORIES)[number] | undefined;
+      for (const candidate of PRIVATE_DIRECTORIES) {
+        if (!candidate.match.test(entry.name)) continue;
+        if (candidate.inside && !(await candidate.inside(full))) continue;
+        rule = candidate;
+        break;
+      }
       if (rule) {
         found.push({
           path: relative,
@@ -1995,12 +2098,21 @@ export async function detectPastedCredentials(
   );
   let cursor = 0;
   let stop = false;
+  /*
+    Every file looked at, read or passed over for its size. Reporting only
+    those read left the count short of its own total: a refused save of
+    Blender stopped on "3700 of 3747 files", which reads as a scan that gave
+    up rather than one that finished.
+  */
+  let looked = 0;
   const lane = async (): Promise<void> => {
     for (;;) {
       if (stop) return;
       const at = cursor;
       cursor += 1;
       if (at >= wanted.length) return;
+      looked += 1;
+      if (onScanned && looked % 50 === 0) onScanned(looked, wanted.length);
       if (found.length >= MOST_FINDINGS) { stop = true; return; }
       if (read >= MOST_SCANNED_FILES || bytes >= MOST_SCANNED_BYTES) {
         stop = true;
@@ -2019,7 +2131,6 @@ export async function detectPastedCredentials(
       }
       read += 1;
       bytes += contents.byteLength;
-      if (onScanned && read % 50 === 0) onScanned(read, wanted.length);
       if (!looksLikeText(contents)) continue;
       const credentials = findCredentials(contents.toString("utf8"));
       if (credentials.length) found.push({ path: relative, found: credentials });
@@ -2028,6 +2139,7 @@ export async function detectPastedCredentials(
   await Promise.all(
     Array.from({ length: Math.min(LANES, wanted.length) }, () => lane()),
   );
+  if (onScanned && wanted.length) onScanned(looked, wanted.length);
   /*
     `stop` is also set by the findings ceiling, which is a different statement
     from running out of budget — forty findings is plenty to act on, and the
@@ -2110,6 +2222,39 @@ export function isCredentialByName(relativePath: string): boolean {
   );
 }
 
+/*
+  A `.pem` is a container, not a kind of file.
+
+  It holds a private key as readily as a certificate, and the name cannot
+  tell the two apart — so every one was refused. That refused Blender: its
+  bundled Python carries `certifi/cacert.pem` twice, Mozilla's list of the
+  certificate authorities a program should trust, which ships inside every
+  pip there is and is public by design. A certificate is the half of a key
+  pair that exists to be handed out.
+
+  So a `.pem` is opened and judged by its blocks. Only certificates (and
+  revocation lists) clear it; a private key anywhere in it, a block of any
+  other kind, no blocks at all, or a file too large or unreadable to look
+  at all leave it a credential, as before.
+*/
+const CERTIFICATE_BUNDLE_LIMIT = 4 * 1024 * 1024;
+
+export async function holdsOnlyCertificates(full: string): Promise<boolean> {
+  try {
+    const info = await stat(full);
+    if (info.size > CERTIFICATE_BUNDLE_LIMIT) return false;
+    const text = await readFile(full, "latin1");
+    if (/PRIVATE KEY/i.test(text)) return false;
+    const blocks = text.match(/-----BEGIN [A-Z0-9 ]+-----/g) ?? [];
+    return (
+      blocks.length > 0 &&
+      blocks.every((block) => /^-----BEGIN (TRUSTED |X509 )?(CERTIFICATE|CRL)-----$/.test(block))
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function detectSecrets(root: string): Promise<string[]> {
   const found: string[] = [];
   let seen = 0;
@@ -2157,7 +2302,11 @@ export async function detectSecrets(root: string): Promise<string[]> {
             that templates are not credentials.
           */
           const relative = path.relative(root, full).split(path.sep).join("/");
-          if (isCredentialByName(relative)) found.push(relative);
+          if (!isCredentialByName(relative)) continue;
+          if (entry.name.toLowerCase().endsWith(".pem") && (await holdsOnlyCertificates(full))) {
+            continue;
+          }
+          found.push(relative);
         }
       }
     };

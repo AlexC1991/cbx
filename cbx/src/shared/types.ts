@@ -282,6 +282,19 @@ export type UploadProgress = {
   path: string;
   percent: number;
   bytesPerSecond: number;
+  /**
+   * The engine's own stage, when a caller shows it under another name.
+   *
+   * The desktop shows the whole plan as one stretch of its bar, but the plan
+   * runs the same passes as the send — read every file, then price it — and
+   * relabelled as "plan" each pass started the stretch over from nothing.
+   */
+  pass?: UploadStageKey;
+  /** Completion is unmeasured work, not a percentage or an ETA. */
+  completion?: {
+    phase: "preparing" | "confirming" | "retrying" | "local";
+    elapsedSeconds: number;
+  };
 };
 
 export type UploadObjectDefinition = {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * cbx — the CodeBox engine from the command line, talking to CodeRook.
+ * cbx — the CBX engine from the command line, talking to CodeRook.
  *
  * The same engines the desktop application uses — the same scanner, the same
  * ignore rules, the same upload and download — with a terminal in front of
@@ -17,6 +17,8 @@ import { createHash } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { commandWorkspace, commandWorkspaceMcp } from "./workspace_command.js";
+import { unreadReminder } from "./workspace_threads.js";
 
 import {
   collisionCheck,
@@ -36,11 +38,28 @@ import {
 } from "./registry.js";
 import { renderCommandHelp, renderHelp, renderUnknown } from "./help.js";
 import { bar } from "./progress.js";
+import { UploadDisplay } from "./upload_progress.js";
 import { classifyPublishFailure, uploadRequestFor } from "./publish.js";
 import { commandAttach } from "./attach_command.js";
 import { commandBuild } from "./build_command.js";
+import { commandUpdate } from "./update_command.js";
 import { nodeTooOld } from "./node_check.js";
 import { commandPages } from "./pages_command.js";
+import { commandMods } from "./mods_command.js";
+import { commandPrivate } from "./private_command.js";
+import { commandApprove, commandSecret } from "./actions_command.js";
+import { commandIssue } from "./issue_command.js";
+import { commandDeps, commandVerify } from "./verify_command.js";
+import { commandFork, commandSecurity } from "./community_command.js";
+import { commandPr } from "./pr_command.js";
+import {
+  commandAbout,
+  commandFeatures,
+  commandAssistant,
+  commandHandOver,
+  commandLineRules,
+  commandUploadRules,
+} from "./settings_commands.js";
 import {
   commandAi,
   commandVersions,
@@ -65,6 +84,8 @@ import {
   commandDelete,
   commandHooks,
   commandIssues,
+  commandCancel,
+  commandRerun,
   commandLogs,
   commandRuns,
   commandRelease,
@@ -84,7 +105,9 @@ import {
 } from "../../cbx/src/core/worktree.js";
 import { excludes, parseRules } from "../../cbx/src/core/rules.js";
 import { Uploader } from "../../cbx/src/core/upload.js";
-import { Downloader } from "../../cbx/src/core/download.js";
+import { DownloadFailed, Downloader } from "../../cbx/src/core/download.js";
+import { checkIn } from "./machine.js";
+import { commandMachines } from "./workspace_machine.js";
 import { whyUnsafe } from "../../cbx/src/shared/safe_path.js";
 import { maybeFail } from "../../cbx/src/core/faults.js";
 import {
@@ -114,6 +137,7 @@ import {
   localSwitch,
 } from "./local_commands.js";
 import { profileReport } from "../../cbx/src/core/profile.js";
+import { commandRemoteRestore } from "./remote_restore.js";
 import {
   rulesFromSuggestions,
   suggestExclusions,
@@ -171,6 +195,11 @@ const accent = (text: string) => (colour ? `[33m${text}[0m` : text);
 const red = (text: string) => (colour ? `[31m${text}[0m` : text);
 const green = (text: string) => (colour ? `[32m${text}[0m` : text);
 
+/** "1 file", "3 files". */
+function fileCount(count: number): string {
+  return `${count} ${count === 1 ? "file" : "files"}`;
+}
+
 function bytes(value: number): string {
   if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
   if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`;
@@ -181,8 +210,21 @@ function bytes(value: number): string {
 /** One line that rewrites itself, so progress does not scroll the terminal. */
 function progressLine(): (text: string) => void {
   let last = 0;
+  let lastPlain = 0;
   return (text: string) => {
-    if (!process.stdout.isTTY) return;
+    /*
+      Without a terminal (a script, a bot, a CI log) the redrawn bar cannot
+      work, and this used to print nothing at all: a 1.79 GB clone ran for
+      minutes in silence and was taken for a hang (2026-11-05). So a plain
+      line instead, at most every ten seconds.
+    */
+    if (!process.stdout.isTTY) {
+      const now = Date.now();
+      if (now - lastPlain < 10_000) return;
+      lastPlain = now;
+      process.stdout.write(`${text.replace(/\[[0-9;]*m/g, "").replace(/[█░▏▎▍▌▋▊▉]+/g, "").replace(/\s+/g, " ").trim()}\n`);
+      return;
+    }
     /*
       Measured without the colour codes. Padding to the raw length of a string
       carrying escape sequences overshoots by however many invisible
@@ -393,7 +435,22 @@ async function reconcile(
   }
 
   const downloader = new Downloader(credentials);
-  const latest = (await downloader.versions(project.id))[0];
+  const all = await downloader.versions(project.id);
+  /*
+    The head of this folder's line, not the newest version in the project.
+
+    They differ after `cbx undo`: the line goes back to v41 and v42 stays in
+    the history, passed over. Taking the newest here linked a folder "at v42",
+    and its first save — sent after uploading everything — was refused because
+    v42 is not on the line it was saving to. fetchInto learned the same thing.
+  */
+  const lineName = link?.track ?? project.defaultBranch ?? "main";
+  const line = (await new Tracks(credentials).list(project.id)).find(
+    (candidate) => candidate.kind === "line" && candidate.name === lineName,
+  );
+  const latest =
+    (line?.headVersionId && all.find((version) => version.id === line.headVersionId)) ||
+    all[0];
   if (!latest) return { link: link ?? null, baseline: null, behind: null, member };
 
   /*
@@ -415,7 +472,7 @@ async function reconcile(
     if (behind && !options.quiet) {
       console.log(
         dim(
-          `The account is on v${behind.sequence}; this folder is based on v${known.sequence}.`,
+          `The project is on v${behind.sequence}; this folder is based on v${known.sequence}.`,
         ),
       );
     }
@@ -511,7 +568,7 @@ async function commandProjects(): Promise<number> {
   for (const project of all) {
     console.log(
       `${accent(project.slug.padEnd(width))}  v${String(project.versionCount).padEnd(4)}` +
-        `${String(project.fileCount).padStart(6)} files  ${bytes(project.storedBytes).padStart(9)}` +
+        `${String(project.fileCount).padStart(6)} ${project.fileCount === 1 ? "file " : "files"}  ${bytes(project.storedBytes).padStart(9)}` +
         `  ${dim(project.visibility)}`,
     );
   }
@@ -568,6 +625,31 @@ async function commandLink(parsed: Parsed): Promise<number> {
   return 0;
 }
 
+/**
+ * Run a folder command, then tell the project which version this machine's
+ * folder now holds (machine.ts): after a save nothing is left unsent, after a
+ * fetch the count is not known without scanning again.
+ */
+function announcing(run: (parsed: Parsed) => Promise<number>, saved: boolean) {
+  return async (parsed: Parsed): Promise<number> => {
+    const code = await run(parsed);
+    if (code === 0) {
+      const folder = folderFor(parsed);
+      const link = await readLink(folder).catch(() => null);
+      if (link) {
+        await checkIn(link.repositoryId, {
+          kind: "folder",
+          folder,
+          track: link.track ?? null,
+          baseVersionId: link.baseVersionId ?? link.versionId ?? null,
+          changedFiles: saved ? 0 : null,
+        });
+      }
+    }
+    return code;
+  };
+}
+
 async function commandStatus(parsed: Parsed): Promise<number> {
   const folder = folderFor(parsed);
   let link: Link | null;
@@ -594,14 +676,37 @@ async function commandStatus(parsed: Parsed): Promise<number> {
     send, with the flag that would send them spelled out. The safe default
     does not change: a save adds and updates.
   */
-  const found = await changedFiles(folder, rules, baseline, "synchronize");
+  /*
+    The digests submit keeps, so an unchanged file is not read again just to
+    be reported unchanged. Without them status read and hashed every file in
+    the folder each time it ran. What it learns is kept for the next run.
+  */
+  const knownDigests = link?.repositoryId
+    ? await readDigests(link.repositoryId)
+    : new Map<string, { size: number; mtimeMs: number; sha256: string }>();
+  let learned = 0;
+  const remember = knownDigests.set.bind(knownDigests);
+  knownDigests.set = (key, value) => {
+    learned += 1;
+    return remember(key, value);
+  };
+  const found = await changedFiles(folder, rules, baseline, "synchronize", knownDigests, undefined, false);
+  if (learned && link?.repositoryId) await writeDigests(link.repositoryId, knownDigests);
   const gone = found.filter((file) => file.deleted);
   const files = found.filter((file) => !file.deleted);
+  // Tells the project's Actions page what this machine's folder holds; never delays or fails status.
+  void checkIn(link?.repositoryId, {
+    kind: "folder",
+    folder,
+    track: link?.track ?? null,
+    baseVersionId: link?.baseVersionId ?? link?.versionId ?? null,
+    changedFiles: found.length,
+  });
 
   console.log(bold(path.basename(folder)) + dim(`  ${folder}`));
   console.log(
     link
-      ? `Account holds ${accent(`v${link.sequence}`)} · ${Object.keys(link.manifest).length} files ${dim(`(${link.slug})`)}`
+      ? `Account holds ${accent(`v${link.sequence}`)} · ${Object.keys(link.manifest).length} ${Object.keys(link.manifest).length === 1 ? "file" : "files"} ${dim(`(${link.slug})`)}`
       : dim("This folder is not linked to a project."),
   );
   if (!link) {
@@ -744,8 +849,10 @@ async function commandStatus(parsed: Parsed): Promise<number> {
     return 0;
   }
   console.log(`\n${files.length} file${files.length === 1 ? "" : "s"} to submit:`);
+  /* New is not changed: a file the saved version never had was listed as "changed". */
   for (const file of files.slice(0, 50)) {
-    console.log(`  ${accent("changed")}  ${file.path}`);
+    const fresh = !baseline?.has(file.path);
+    console.log(`  ${fresh ? green("new    ") : accent("changed")}  ${file.path}`);
   }
   if (files.length > 50) console.log(dim(`  …and ${files.length - 50} more`));
   deletions();
@@ -919,12 +1026,12 @@ function noteKeptDeletions(
   folder: string,
   baseline: Map<string, string> | null,
   syncing: boolean,
-): void {
-  if (syncing || !baseline?.size) return;
+): number {
+  if (syncing || !baseline?.size) return 0;
   const gone = [...baseline.keys()].filter(
     (file) => !existsSync(path.join(folder, ...file.split("/"))),
   );
-  if (!gone.length) return;
+  if (!gone.length) return 0;
   console.log(
     dim(
       `${gone.length} file${gone.length === 1 ? "" : "s"} deleted here ${gone.length === 1 ? "is" : "are"} still in the saved version` +
@@ -932,6 +1039,25 @@ function noteKeptDeletions(
         ` run cbx submit --sync to remove ${gone.length === 1 ? "it" : "them"}.`,
     ),
   );
+  return gone.length;
+}
+
+/*
+  The service names each clash by its kind ("text_region", "add_add", …).
+  Those are its words, not the reader's: say what actually happened.
+*/
+const CONFLICT_WORDS: Record<string, string> = {
+  text_region: "you both changed the same lines",
+  modify_delete: "changed on one side, removed on the other",
+  add_add: "added on both sides, differently",
+  rename: "renamed differently on each side",
+  path_collision: "two files now want the same name",
+  binary: "not text, so it can't be combined line by line",
+  symlink: "a link both sides changed",
+  structured: "both changed the same entry",
+};
+function conflictWords(kind: string): string {
+  return CONFLICT_WORDS[kind] ?? kind.replace(/_/g, " ");
 }
 
 async function commandSubmit(parsed: Parsed): Promise<number> {
@@ -1114,6 +1240,22 @@ async function commandSubmit(parsed: Parsed): Promise<number> {
   }
 
   if (!files.length) {
+    /*
+      Deleted files are not "nothing". A plain save never removes, so a
+      folder with 1,723 files deleted from it was told it "matches the saved
+      version" straight after status had listed every one of them — found by
+      deleting a folder from a copy of the Cheat Engine sources.
+    */
+    if (!hasFlag(parsed, "sync")) {
+      const kept = [...(baseline?.keys() ?? [])].some(
+        (file) => !existsSync(path.join(folder, ...file.split("/"))),
+      );
+      if (kept) {
+        console.log("Nothing new to submit.");
+        noteKeptDeletions(folder, baseline, false);
+        return 0;
+      }
+    }
     // Having nothing to send is not the same as holding the whole version:
     // a merge can leave this folder with an older copy of somebody else's
     // file. Saying so is what stops "nothing to do" from reading as "level".
@@ -1296,6 +1438,7 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
   }
 
   const line = progressLine();
+  const uploadDisplay = new UploadDisplay();
   let uploader = new Uploader(credentials);
   /*
     Built by the shared description, so this and the git remote helper cannot
@@ -1392,8 +1535,17 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
         if (ahead.collidingPaths.length > 5) {
           console.log(dim(`  and ${ahead.collidingPaths.length - 5} more`));
         }
+        /*
+          This check compares whole files, so it cannot know yet whether the
+          two of you touched the same lines. The service combines text line
+          by line when it can; saying "it will be put on a merge" here was a
+          promise the next line ("Saved v3") then broke.
+        */
         console.log(
-          dim("  Your upload will be kept whole and put on a merge for you to settle."),
+          dim("  If you changed different lines of a text file, the two combine on their own."),
+        );
+        console.log(
+          dim("  Otherwise your upload is kept whole on a merge for you to settle."),
         );
         console.log(dim("  Run cbx get first if you would rather build on theirs."));
         console.log("");
@@ -1426,8 +1578,19 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
     command now does it itself, a few times, before giving up.
   */
   const resumeAfter = [10, 30, 60];
+  /*
+    The project an attempt created, for the attempts after it. A first save
+    creates its project while planning, and the project stays once anything
+    has been sent so a retry can reuse what arrived; but the retry used to ask
+    to create it again under the same name and was refused, so a dropped
+    connection during a first save could never be picked up.
+  */
+  let createdRepositoryId: string | null = null;
   for (let resumed = 0; ; resumed += 1) {
   try {
+    if (createdRepositoryId && !uploadRequest.repositoryId) {
+      Object.assign(uploadRequest, { repositoryId: createdRepositoryId });
+    }
     const plan = await uploader.plan(
       uploadRequest,
       (progress) => {
@@ -1439,13 +1602,14 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
       },
     );
     done(line);
+    if (plan.repositoryCreated) createdRepositoryId = plan.repositoryId;
     console.log(
       `${accent("Upload plan")}  ${bytes(plan.sourceBytes)} selected → ` +
         `${bytes(plan.compactedBytes)} compacted; ${bytes(plan.chargeableBytes)} new storage.`,
     );
     console.log(
       plan.allowance.exempt
-        ? dim("Annual plan: the monthly staged upload allowance does not apply.")
+        ? dim("No monthly upload steps on this plan; the storage limit is the only one.")
         : dim(
             `Monthly stage ${plan.allowance.stage}: ${plan.allowance.unlockedPercent}% unlocked, ` +
               `${bytes(plan.allowance.remainingBytes)} remains after this reservation.`,
@@ -1472,16 +1636,12 @@ Pass ${accent("--allow-secrets")} if these are not real keys.`,
     result = await uploader.execute(
       uploadRequest,
       plan,
-      (progress) => {
-        line(
-          `  ${track(progress.percent)} ${String(progress.percent).padStart(3)}%  ` +
-            `${progress.stage.padEnd(7)} ${progress.files}/${progress.totalFiles}  ` +
-            dim(progress.path.slice(-40)),
-        );
-      },
+      (progress) => uploadDisplay.report(progress),
     );
+    uploadDisplay.done();
     break;
   } catch (error) {
+    uploadDisplay.done();
     done(line);
     /*
       Classified by the shared description rather than by a private regular
@@ -1549,14 +1709,14 @@ The connection failed: ${text}`));
       `\nSomebody else saved first, and ${
         result.mergeTrack.conflicts.length === 1
           ? "one file overlaps"
-          : `${result.mergeTrack.conflicts.length} files overlap`
+          : `${result.mergeTrack.conflicts.length} ${result.mergeTrack.conflicts.length === 1 ? "file overlaps" : "files overlap"}`
       }.`,
     );
     console.log(
       `Your work is complete and kept as ${accent(result.mergeTrack.reference)}:`,
     );
     for (const conflict of result.mergeTrack.conflicts.slice(0, 20)) {
-      console.log(`  ${red(conflict.path)}  ${dim(conflict.kind)}`);
+      console.log(`  ${red(conflict.path)}  ${dim(conflictWords(conflict.kind))}`);
     }
     console.log(
       `\nRun ${accent(`cbx merge ${result.mergeTrack.reference}`)} to decide,` +
@@ -1790,16 +1950,30 @@ async function commandGet(parsed: Parsed): Promise<number> {
         would bury the only copy.
       */
       if (resuming) {
+        /*
+          Only a file this fetch rewrites can be buried by finishing it: one
+          whose incoming copy differs from what was placed here. An edit to a
+          file the version left alone is kept, exactly as an ordinary fetch
+          keeps it, so it is no reason to stop. It used to be: completing in
+          "replace" mode rewrote every file, so any edit at all, anywhere,
+          refused the resume (2026-11-06, two page edits blocked a catch-up).
+        */
         const notYetArrived = await changedFiles(folder, rules, incoming);
         const changedInTheGap = notYetArrived.filter(
           (file) =>
             !file.deleted &&
             incoming.has(file.path) &&
+            incoming.get(file.path) !== link.local![file.path] &&
             edited.some((one) => one.path === file.path),
         );
         if (!changedInTheGap.length) {
+          /*
+            Reconciling finishes the job: every file the version changed is
+            placed (the half the interrupted run already placed are placed
+            again, harmlessly), and what it left alone stays as it is.
+          */
           return fetchInto(
-            link.repositoryId, folder, link.slug, link.local ?? null, "replace",
+            link.repositoryId, folder, link.slug, link.local ?? null, "reconcile",
             await trackFor(folder),
           );
         }
@@ -2007,22 +2181,43 @@ async function fetchInto(
   }
 
   const line = progressLine();
-  const result = await downloader.run(
-    repositoryId,
-    latest.id,
-    destination,
-    (progress) => {
-      line(
-        `  ${track(progress.percent)} ${String(progress.percent).padStart(3)}%  ` +
-          `${progress.files}/${progress.totalFiles}  ` +
-          dim(progress.path.slice(-40)),
-      );
-    },
-    // What this folder received last time, so a file the project has since
-    // dropped is removed while everything untracked is left alone.
-    held,
-    mode,
-  );
+  let result: Awaited<ReturnType<Downloader["run"]>>;
+  try {
+    result = await downloader.run(
+      repositoryId,
+      latest.id,
+      destination,
+      (progress) => {
+        line(
+          `  ${track(progress.percent)} ${String(progress.percent).padStart(3)}%  ` +
+            `${progress.files}/${progress.totalFiles}  ` +
+            dim(progress.path.slice(-40)),
+        );
+      },
+      // What this folder received last time, so a file the project has since
+      // dropped is removed while everything untracked is left alone.
+      held,
+      mode,
+    );
+  } catch (error) {
+    done(line);
+    if (!(error instanceof DownloadFailed)) throw error;
+    /*
+      Named, and with what it did not do. A transfer fails before anything
+      is put in place, so the folder is as it was and the staging copy is
+      gone — which is what someone deciding whether to run it again needs.
+    */
+    console.error(red(error.message));
+    console.error(
+      dim(
+        (existsSync(destination)
+          ? `Nothing in ${destination} was changed.`
+          : `No folder was made at ${destination}.`) +
+          " Run the same command again to retry.",
+      ),
+    );
+    return 1;
+  }
   done(line);
   /*
     Said, not hidden. The files are right, but the service sent them still
@@ -2064,7 +2259,7 @@ async function fetchInto(
   // The record is written; the run has not reported success yet.
   maybeFail("get:after-record");
   console.log(
-    `${accent(`v${latest.sequence}`)} · ${result.files} files · ${bytes(result.bytes)} into ${destination}`,
+    `${accent(`v${latest.sequence}`)} · ${fileCount(result.files)} · ${bytes(result.bytes)} into ${destination}`,
   );
   return 0;
 }
@@ -2228,7 +2423,7 @@ async function commandUnbundle(parsed: Parsed): Promise<number> {
     );
   });
   done(line);
-  console.log(`${result.files} files · ${bytes(result.bytes)} into ${destination}`);
+  console.log(`${fileCount(result.files)} · ${bytes(result.bytes)} into ${destination}`);
   return 0;
 }
 
@@ -2244,7 +2439,7 @@ async function commandInspect(parsed: Parsed): Promise<number> {
     `${bold(manifest.source_name)} · format ${manifest.format} v${manifest.format_version}`,
   );
   console.log(
-    `${manifest.files.length} files · ${bytes(total)} · ` +
+    `${fileCount(manifest.files.length)} · ${bytes(total)} · ` +
       `${Object.keys(manifest.chunks).length} chunks`,
   );
   if (hasFlag(parsed, "files")) {
@@ -2509,15 +2704,19 @@ async function commandMerge(parsed: Parsed): Promise<number> {
   }
   console.log(
     `
-${accent(now.mergeTrack.reference)} · ${now.provisional.fileCount} files · ` +
+${accent(now.mergeTrack.reference)} · ` +
+      /*
+        The combined version is only counted once it can be built; until then
+        its file count is 0, which read as "your upload was empty".
+      */
       (now.provisional.ready
-        ? "ready to apply"
+        ? `${fileCount(now.provisional.fileCount)} · ready to apply`
         : `${now.provisional.unresolvedPaths.length} still to decide`),
   );
   for (const conflict of now.conflicts) {
     console.log(
       `  ${conflict.resolvedAt ? accent("decided") : red("waiting")}  ${conflict.path}` +
-        `  ${dim(conflict.kind)}${conflict.resolution ? dim(` (${conflict.resolution})`) : ""}`,
+        `  ${dim(conflictWords(conflict.kind))}${conflict.resolution ? dim(` (${conflict.resolution})`) : ""}`,
     );
   }
 
@@ -2542,7 +2741,7 @@ Applied as ${accent(`v${applied.version.sequence}`)}.`);
       dim(
         `
 --mine keeps yours, --theirs keeps what was already saved,` +
-          ` --drop removes the file.
+          ` --both keeps theirs and saves yours beside it, --drop removes the file.
 Add --path <file> for one file, then --apply when ready.`,
       ),
     );
@@ -2728,7 +2927,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "status",
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "what is here that is not saved yet",
     usage: "status [folder]",
     detail:
@@ -2741,7 +2940,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "submit",
     aliases: ["publish"],
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "send the changes as a new save",
     usage: 'submit [folder] -m "…"',
     detail:
@@ -2793,12 +2992,12 @@ const SPECS: CommandSpec[] = [
       'cbx submit --into voxai-coder -m "First save from the Linux machine"',
       'cbx submit --track spike -m "Try the other encoder"',
     ],
-    run: commandSubmit,
+    run: announcing(commandSubmit, true),
   },
   {
     name: "diff",
     aliases: ["changes"],
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "what changed, line by line",
     usage: "diff [from] [to]",
     detail:
@@ -2879,19 +3078,22 @@ const SPECS: CommandSpec[] = [
     group: "History on this machine",
     summary: "put files back the way a save had them",
     usage: "restore [paths…] [--from <save>]",
+    brief: "restore [paths…]",
     detail:
       "With no paths, makes the whole folder match the save; with paths,\n" +
       "only those files and folders. The default is the last save, which\n" +
       "throws away what you changed since.\n\n" +
+      "In a folder linked to a CodeRook project, the save is a Version on\n" +
+      "CodeRook: the one the folder is on, or --from vN.\n\n" +
       "Unsaved changes to a file it would overwrite stop it, and it lists\n" +
       "them. Add --force to discard them. Files the history has never held\n" +
       "are left alone either way, and your line does not move.",
     options: [
-      { flags: "--from <save>", description: "a line, line~N, or the start of a save id" },
+      { flags: "--from <save>", description: "a line, line~N, or the start of a save id; vN in a linked folder" },
       { flags: "-f, --force", description: "overwrite unsaved changes" },
     ],
-    examples: ["cbx restore src/player.ts --force", "cbx restore --from main~3"],
-    run: commandRestore,
+    examples: ["cbx restore src/player.ts --force", "cbx restore --from main~3", "cbx restore website/app --from v272"],
+    run: localFirst((parsed) => commandRestore(parsed), commandRemoteRestore),
   },
   {
     name: "switch",
@@ -2915,7 +3117,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "link",
-    group: "Working with a folder",
+    group: "Getting started",
     summary: "connect this folder to a project already on your account",
     usage: "link <project> [folder]",
     detail:
@@ -2930,7 +3132,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "unlink",
-    group: "Working with a folder",
+    group: "Getting started",
     summary: "detach this folder from its project",
     usage: "unlink [folder]",
     detail:
@@ -3022,7 +3224,7 @@ const SPECS: CommandSpec[] = [
     */
     name: "track",
     aliases: ["checkout"],
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "show or change the line this folder saves to",
     usage: "track [name]",
     detail:
@@ -3044,7 +3246,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "tracks",
     aliases: ["branch", "branches"],
-    group: "Your projects",
+    group: "Lines, merges and pull requests",
     summary: "the lines a project has, and any waiting on a decision",
     usage: "tracks [project]",
     detail:
@@ -3057,17 +3259,17 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "get",
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "bring this folder up to date",
     usage: "get [folder]",
     options: [
       { flags: "--replace", description: "make it an exact copy, discarding local changes" },
     ],
-    run: commandGet,
+    run: announcing(commandGet, false),
   },
   {
     name: "clone",
-    group: "Working with a folder",
+    group: "Getting started",
     summary: "fetch a project into a new folder",
     usage: "clone <project> [dir]",
     options: [
@@ -3082,7 +3284,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "licence",
     aliases: ["license"],
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "choose a licence, so people may actually use your work",
     usage: "licence [name] [folder]",
     detail:
@@ -3113,7 +3315,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "ignore",
     aliases: ["rules"],
-    group: "Working with a folder",
+    group: "Saving work",
     summary: "show the ignore rules for this folder",
     usage: "ignore [folder]",
     detail:
@@ -3149,14 +3351,14 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "projects",
-    group: "Your projects",
+    group: "Getting started",
     summary: "every project on your account",
     usage: "projects",
     run: () => commandProjects(),
   },
   {
     name: "versions",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "what has been saved to a project",
     usage: "versions [project]",
     detail:
@@ -3177,28 +3379,75 @@ const SPECS: CommandSpec[] = [
     run: commandVersions,
   },
   {
-    name: "ai",
-    group: "Your projects",
-    summary: "what this project says about machines",
-    usage: "ai [project] [--read off]",
+    name: "workspace",
+    group: "Workspaces",
+    summary: "edit, save and run a private project remotely without a checkout",
+    usage: "workspace | workspace <usage|open|list|show|read|files|search|diff|patch|put|starter|review|reviewers|save|run|logs|cancel|deploy|preview|handoff|close|recipe|assign|assignments|unassign|checkout|say|thread|mute|unmute> <project> [workspace] [job] | workspace put <project> <workspace> <path…> | workspace push [folder] | workspace watch [project] [workspace]",
+    brief: "workspace <action> <project>",
+    detail: "Works on CodeRook's durable remote draft, never the current local folder. Use --data-file for structured edits or recipe configuration. Mutations need the reviewed --revision and a unique --key; reuse the same key and request when retrying. Recipes reference existing project workflows. Usage reads the shared workspace credits and separate PR allowance without a draft ID. put copies files from this folder into a draft: text as text, images, fonts and other binary files as bytes (up to 1 MiB each), a file that is gone here is removed there, and each file must still be the version the draft holds, so a teammate's edit is never overwritten. starter reads this folder (package.json scripts, Cargo.toml, go.mod, Python) and suggests one check recipe per package so drafts have something to run; --apply adds them, never replacing a recipe that exists. review shows who must OK a draft before it is saved or deployed; --ok or --changes -m gives your verdict on the current revision, and counts only from the reviewer's own sign-in or token, never a name given with --as. reviewers lists the project's rules, and an administrator sets them with --data-file. Saving and deploying are separate operations. Run on its own at a terminal, it lists your open workspaces with their unread messages: choose one to see its changes and what is being discussed, and reply, save, run checks, hand it over or close it with one key. say and thread post to and read a workspace's discussion as JSON; a machine signed in to your account can name itself with --as (or CBX_NAME) so its messages and unread count are its own. watch prints each new message, each message addressed to you (@your name, or the name given with --as) and each new saved version as it happens, until stopped; --json gives one JSON object per line for a program.",
+    options: [
+      {flags:"--data-file <path>",description:"read an operation's JSON from this local file"},
+      {flags:"--name <name>",description:"name a new workspace"},
+      {flags:"--track <track>",description:"base the workspace on this project Track"},
+      {flags:"--base-version <id>",description:"select a saved base version"},
+      {flags:"--revision <number>",description:"the exact reviewed workspace revision"},
+      {flags:"--key <operation-key>",description:"unique idempotency key; preserve it for retries"},
+      {flags:"--path <path>",description:"read this project-relative file"},
+      {flags:"--query <text>",description:"text to find in the remote workspace"},
+      {flags:"--offset <number>",description:"continue a paginated listing, search or diff"},
+      {flags:"--start-line <number>",description:"first text line to read"},
+      {flags:"--lines <number>",description:"maximum text lines to read"},
+      {flags:"--recipe <name>",description:"configured hosted execution recipe"},
+      {flags:"--target <target>",description:"exact configured deployment target"},
+      {flags:"--version <id>",description:"saved workspace version to deploy"},
+      {flags:"-m, --message <text>",description:"describe the version being saved"},
+      {flags:"--note <text>",description:"task context for another computer/assistant"},
+      {flags:"--days <number>",description:"assign: how long the handed-over token lasts (1-90, default 14)"},
+      {flags:"--save",description:"push: save the draft after sending the changes"},
+      {flags:"--dry-run",description:"push: list what would be sent, send nothing"},
+      {flags:"--as <name>",description:"say/thread/list/save: post and read as this machine name (or set CBX_NAME)"},
+      {flags:"--unread",description:"thread: only messages this reader has not read"},
+      {flags:"--peek",description:"thread: read without marking anything read"},
+      {flags:"--after <time>",description:"thread: continue from the next page's time"},
+      {flags:"--root <folder>",description:"put/starter: the project folder (default: here)"},
+      {flags:"--apply",description:"starter: create the suggested workflows and recipes"},
+      {flags:"--ok",description:"review: approve the draft's current revision"},
+      {flags:"--changes",description:"review: ask for changes (say what with -m)"},
+      {flags:"--json",description:"watch: one JSON object per line; starter: the plan as JSON"},
+      {flags:"--interval <seconds>",description:"watch: how often to look (default 20, at least 5)"},
+    ],
+    examples:["cbx workspace open my-project --name \"Laptop work\" --key laptop-open-001","cbx workspace list my-project","cbx workspace assign my-project <draft> --name Laptop","cbx workspace checkout my-project <draft>","cbx workspace push --save -m \"Fix the export dialog\"","cbx workspace","cbx workspace say my-project <draft> -m \"Tests updated\" --as GrokBot","cbx workspace thread my-project <draft> --unread","cbx workspace watch my-project --as GrokBot --json","cbx workspace put my-project <draft> website/app/page.tsx website/public/og.png","cbx workspace starter my-project --apply","cbx workspace review my-project <draft> --ok -m \"Matches the concept\""],
+    run: commandWorkspace,
+  },
+  {
+    name: "machines",
+    group: "Actions and builds",
+    summary: "the PCs on a project, how far behind each is, and its runners",
+    usage: "machines [project]",
     detail:
-      "Shows the four answers a project gives about automated clients, and\n" +
-      "changes them. Everything is allowed until you say otherwise.\n\n" +
+      "Every PC with a folder linked to the project, or working on a draft handed to it, says which version it holds when cbx runs there. " +
+      "This lists them with how many versions behind the project's line each is and how many files it has not saved, then the project's runners. " +
+      "Machines not seen for 30 days are left out. Set CODEROOK_NO_PRESENCE to keep a machine off the list.",
+    examples: ["cbx machines", "cbx machines my-project"],
+    run: async (parsed) => commandMachines(parsed, (await readLink(folderFor(parsed)).catch(() => null))?.repositoryId ?? null),
+  },
+  {
+    name: "ai",
+    group: "Project settings",
+    summary: "what this project lets AI do (read only)",
+    usage: "ai [project]",
+    detail:
+      "Shows the four answers a project gives about automated clients: can AI\n" +
+      "read it, download it, contribute to it, and make requests to it.\n" +
+      "Everything is allowed until somebody says otherwise.\n\n" +
       "Turning reading off is the one that refuses model training: it declares\n" +
       "the project as not-for-training in the page, in the response headers,\n" +
-      "and in the service's robots.txt. Turning downloads off does not — those\n" +
-      "are separate questions and answering one says nothing about the other.",
-    options: [
-      { flags: "--read [off]", description: "reading, indexing, summarising, training" },
-      { flags: "--download [off]", description: "taking the files" },
-      { flags: "--contribute [off]", description: "automated contributions" },
-      { flags: "--request [off]", description: "automated calls to its endpoints" },
-    ],
-    examples: [
-      "cbx ai my-project",
-      "cbx ai my-project --read off",
-      "cbx ai my-project --download off --request off",
-    ],
+      "and in the service's robots.txt.\n\n" +
+      "These are changed by a person, on the website (the project's Settings →\n" +
+      "Access & AI) or in the desktop app, never from the command line. The\n" +
+      "service refuses the change from any token, so an assistant holding one\n" +
+      "cannot switch off the rule that keeps it out.",
+    examples: ["cbx ai", "cbx ai my-project"],
     run: commandAi,
   },
   {
@@ -3207,7 +3456,7 @@ const SPECS: CommandSpec[] = [
       release. This is who can reach the project, and it is named for that.
     */
     name: "visibility",
-    group: "Your projects",
+    group: "Project settings",
     summary: "who can reach a project: private, link only or public",
     usage: "visibility [level] [project]",
     detail:
@@ -3232,8 +3481,191 @@ const SPECS: CommandSpec[] = [
     run: commandVisibility,
   },
   {
+    /*
+      Not `name` or `rename`, which read as acting on a file or a line. This
+      is what the project says about itself: the website's Settings → General.
+    */
+    name: "about",
+    group: "Project settings",
+    summary: "a project's name, description and address",
+    usage: "about [project] [--name <text>] [--description <text>]",
+    brief: "about [project]",
+    detail:
+      "Shows the project's name, description, address and visibility, and\n" +
+      "changes the name or the description. The address comes from the\n" +
+      "project's short name, which stays as it is. An empty description\n" +
+      "clears it.",
+    options: [
+      { flags: "--name <text>", description: "what the project is called" },
+      { flags: "--description <text>", description: "one or two sentences about it" },
+      { flags: "--project <name>", description: "a project other than this folder's" },
+    ],
+    examples: [
+      "cbx about",
+      'cbx about --name "Night Owl Diner"',
+      'cbx about my-project --description "A diner sim set after midnight."',
+    ],
+    run: commandAbout,
+  },
+  {
+    /* Settings → General → Features: which parts a project has, and who sees each. */
+    name: "features",
+    group: "Project settings",
+    summary: "which parts a project has, and who sees each",
+    usage:
+      "features [project] [--issues <choice>] [--pulls <choice>] [--actions <choice>] [--analytics <choice>] [--collaborators <choice>] [--storage <choice>]",
+    brief: "features [project]",
+    detail:
+      "Shows each part of the project and who sees it, and changes them.\n" +
+      "A choice is off (the tab goes for everybody), members (the project's\n" +
+      "own people) or everyone (visitors to a public project too: they read\n" +
+      "issues, pull requests and runs, and anyone signed in can open issues\n" +
+      "and comment). Storage is never everyone's: it is your account's quota.",
+    options: [
+      { flags: "--issues <choice>", description: "off, members or everyone" },
+      { flags: "--pulls <choice>", description: "pull requests: off, members or everyone" },
+      { flags: "--actions <choice>", description: "runs and their logs: off, members or everyone" },
+      { flags: "--analytics <choice>", description: "off, members or everyone" },
+      { flags: "--collaborators <choice>", description: "who works on it: off, members or everyone" },
+      { flags: "--storage <choice>", description: "off or members" },
+      { flags: "--project <name>", description: "a project other than this folder's" },
+    ],
+    examples: ["cbx features", "cbx features --issues everyone --pulls everyone", "cbx features my-project --analytics off"],
+    run: commandFeatures,
+  },
+  {
+    /*
+      Beside `cbx tracks` rather than inside it. That lists where somebody can
+      save and is read all day; these are the rules an owner sets once.
+    */
+    name: "line-rules",
+    group: "Lines, merges and pull requests",
+    summary: "protection, approvals and required checks on each line",
+    usage:
+      "line-rules [line] [--protect|--unprotect] [--approvals <n>] [--checks <a,b>] [--code-owners on|off] [--project <p>]",
+    brief: "line-rules [line] [options]",
+    detail:
+      "With no line, lists every line with its rules and the code owners read\n" +
+      "from the default line's CODEOWNERS file. Name a line to change it — the\n" +
+      "website's Settings → Lines & reviews. Only the owner and admins can.\n\n" +
+      "A protected line refuses restores and merges that would overwrite it.\n" +
+      "Approvals is how many people must approve before a merge may land (0 to\n" +
+      "10). Checks are the names that must pass, comma separated; none clears\n" +
+      "them. Code owners on means a code owner of what changed must approve.",
+    options: [
+      { flags: "--protect", description: "protect the line" },
+      { flags: "--unprotect", description: "stop protecting it" },
+      { flags: "--approvals <n>", description: "approvals a merge needs, 0 to 10" },
+      { flags: "--checks <a,b>", description: "checks that must pass; none for no checks" },
+      { flags: "--code-owners <on|off>", description: "whether a code owner must approve" },
+      { flags: "--project <name>", description: "a project other than this folder's" },
+    ],
+    examples: [
+      "cbx line-rules",
+      "cbx line-rules main --protect --approvals 1",
+      "cbx line-rules main --checks build,test --code-owners on",
+      "cbx line-rules release --unprotect --checks none",
+    ],
+    run: commandLineRules,
+  },
+  {
+    name: "upload-rules",
+    group: "Project settings",
+    summary: "what uploads leave out, and encrypting secret files",
+    usage:
+      "upload-rules [--ignore <file>] [--keep <file>] [--encrypt on|off] [--warn-large <MiB>] [--hold-pushes on|off] [--project <p>]",
+    brief: "upload-rules [options]",
+    detail:
+      "The project's upload rules — the website's Settings → Files & privacy →\n" +
+      "Encrypted uploads. The desktop app and the website's scans read them.\n" +
+      "Ignore rules leave files out; keep rules bring back what an ignore rule\n" +
+      "caught. Both are read from a file of patterns, one per line, in the\n" +
+      "shape of a .gitignore; none clears them. This folder's own ignore file\n" +
+      "is `cbx ignore`.\n\n" +
+      "--encrypt covers files recognised as secrets before they are stored.\n" +
+      "--hold-pushes makes saves from anybody below admin wait for an admin to\n" +
+      "accept them (see `cbx held`). Owners and admins change these.",
+    options: [
+      { flags: "--ignore <file>", description: "replace the ignore rules with this file's" },
+      { flags: "--keep <file>", description: "replace the keep rules with this file's" },
+      { flags: "--encrypt <on|off>", description: "encrypt files recognised as secrets" },
+      { flags: "--warn-large <MiB>", description: "warn about files larger than this" },
+      { flags: "--hold-pushes <on|off>", description: "saves below admin wait to be accepted" },
+      { flags: "--project <name>", description: "a project other than this folder's" },
+    ],
+    examples: [
+      "cbx upload-rules",
+      "cbx upload-rules --ignore .coderookignore --warn-large 512",
+      "cbx upload-rules --encrypt on --keep none",
+    ],
+    run: commandUploadRules,
+  },
+  {
+    name: "assistant",
+    group: "Project settings",
+    summary: "the pull-request assistant: when it works and what it may do",
+    usage:
+      "assistant [manual|automated] [project] [--review on|off] [--describe on|off] [--suggest on|off] [--change on|off] [--approve on|off] [--merge on|off]",
+    brief: "assistant [manual|automated]",
+    detail:
+      "Manual means it works only when somebody asks on a pull request.\n" +
+      "Automated means it works on its own, doing what is switched on:\n" +
+      "reviewing, describing, suggesting, changing, approving and merging.\n" +
+      "Merging needs approving on too. Automated comes with a subscription on\n" +
+      "the owner's account. Only the project's admins change it — the\n" +
+      "website's Settings → Automation.",
+    options: [
+      { flags: "--review <on|off>", description: "review each pull request" },
+      { flags: "--describe <on|off>", description: "write the description" },
+      { flags: "--suggest <on|off>", description: "suggest changes" },
+      { flags: "--change <on|off>", description: "make changes when asked" },
+      { flags: "--approve <on|off>", description: "approve when it finds nothing" },
+      { flags: "--merge <on|off>", description: "merge what it approved (needs --approve on)" },
+      { flags: "--project <name>", description: "a project other than this folder's" },
+    ],
+    examples: [
+      "cbx assistant",
+      "cbx assistant automated --review on --describe on",
+      "cbx assistant --approve on --merge on",
+      "cbx assistant manual",
+    ],
+    run: commandAssistant,
+  },
+  {
+    /*
+      Not `transfer`, which already brings a project in from GitHub, GitLab
+      or Codeberg. This hands one of yours to somebody else.
+    */
+    name: "hand-over",
+    group: "Project settings",
+    summary: "offer a project to another owner, or answer an offer",
+    usage: "hand-over <username|email> [project] [--drop-access] [--yes] | hand-over offers | hand-over accept|decline|cancel <project>",
+    brief: "hand-over <user> [project]",
+    detail:
+      "Offers the project to another account, as the website's Settings →\n" +
+      "Danger zone does. Nothing moves until they accept, and the offer lapses\n" +
+      "after fourteen days. Once accepted it is theirs, and only they can give\n" +
+      "it back, so this asks for TRANSFER to be typed unless --yes is given.\n" +
+      "Only the owner can offer a project.\n\n" +
+      "You keep admin access afterwards unless --drop-access says otherwise.\n" +
+      "`hand-over offers` lists offers to you and by you; accept or decline one\n" +
+      "made to you, or cancel one you made.",
+    options: [
+      { flags: "--drop-access", description: "give up your access when they accept" },
+      { flags: "-y, --yes", description: "offer it without asking, for scripts" },
+      { flags: "--project <name>", description: "a project other than this folder's" },
+    ],
+    examples: [
+      "cbx hand-over sam my-project",
+      "cbx hand-over sam@example.com --drop-access",
+      "cbx hand-over offers",
+      "cbx hand-over accept night-owl-diner",
+    ],
+    run: commandHandOver,
+  },
+  {
     name: "pages",
-    group: "Your projects",
+    group: "Project settings",
     summary: "serve a public project as a website",
     usage: "pages [auto|on|off] [project]",
     detail:
@@ -3266,8 +3698,103 @@ const SPECS: CommandSpec[] = [
     run: commandPages,
   },
   {
+    name: "private",
+    group: "Project settings",
+    summary: "files and folders only the project's own people may see",
+    usage: "private [list|add|remove|set] [pattern…] [--project <project>]",
+    brief: "private [list|add|remove|set]",
+    detail:
+      "Keeps chosen files out of sight in a public project: visitors, the\n" +
+      "public API, git clone, zips, Pages and search leave them out, while\n" +
+      "members see everything. Patterns work like a .gitignore:\n\n" +
+      "  design/          a folder of that name, anywhere\n" +
+      "  *.psd            every file of a type\n" +
+      "  docs/internal    a path from the top of the project\n" +
+      "  src/**/*.key     any depth in between\n\n" +
+      "The list is kept on the project, not in a file, so it covers every\n" +
+      "version at once, old ones included, and a save cannot undo it. Only the\n" +
+      "project's owner or an admin can change it.",
+    options: [
+      { flags: "--project <project>", description: "a project other than this folder's" },
+    ],
+    examples: [
+      'cbx private add "design/" "*.psd"',
+      "cbx private list",
+      'cbx private remove "*.psd"',
+    ],
+    run: commandPrivate,
+  },
+  {
+    name: "mods",
+    group: "Mods and bundles",
+    summary: "mod repositories for games: set one up, publish to one",
+    usage: "mods <create|repos|info|settings|builds|list|publish|remove|block|reports|delete> …",
+    brief: "mods <action> …",
+    detail:
+      "A mod repository is where a game's players get mods from. Its owner\n" +
+      "sets the rules — which file types a mod may hold, archives opened and\n" +
+      "checked too, the manifest each upload carries, size limits, and whether\n" +
+      "anybody or only the owner may upload. Modders publish with their own\n" +
+      "CodeRook accounts; nothing is listed until it passes the rules and a\n" +
+      "malware scan, and anything that runs (.exe, .dll, scripts) is refused\n" +
+      "in every repository. The game's client reads a catalogue signed with\n" +
+      "the repository's own key: see coderook.com/docs#mod-repositories.\n\n" +
+      "  create <repo> --name \"Game\"   set one up; prints its address and public key\n" +
+      "  repos                          the repositories you run\n" +
+      "  info <repo>                    a repository's rules, for anybody\n" +
+      "  settings <repo> [rules…]       change the rules (owner)\n" +
+      "  builds <repo>                  game builds allowed to read it (owner)\n" +
+      "  publish <folder|zip> --repo <repo>   upload a mod; waits for its checks\n" +
+      "  list <repo> [--all]            your mods and how their checks went\n" +
+      "  remove <mod> --repo <repo>     take a mod down\n" +
+      "  block <username> --repo <repo> stop an uploader (owner)\n" +
+      "  reports <repo>                 what players reported (owner)\n" +
+      "  delete <repo>                  delete a repository and everything in it",
+    options: [
+      { flags: "--name <text>", description: "create/settings: the game's name" },
+      { flags: "--allow <exts>", description: "create/settings: file types a mod may hold, e.g. .png,.json" },
+      { flags: "--nested <exts>", description: "create/settings: archives inside a mod that are opened and checked too" },
+      { flags: "--manifest <file|none>", description: "create/settings: the manifest every part carries (default mod.json)" },
+      { flags: "--fields <list>", description: "create/settings: manifest fields that must match: id,name,folder,version" },
+      { flags: "--uploads <anyone|owner>", description: "create/settings: who may upload" },
+      { flags: "--max-part <size>", description: "create/settings: largest part, e.g. 2GB" },
+      { flags: "--register <file>", description: "builds: register the build secret in this file (never printed)" },
+      { flags: "--new", description: "builds: have the service make a build secret (shown once)" },
+      { flags: "--off <id>", description: "builds: turn a build off" },
+      { flags: "--repo <repo>", description: "publish/list/remove/block: which repository" },
+      { flags: "--part <id>", description: "publish: which part of the mod this is (default main)" },
+      { flags: "--id <mod>", description: "publish: the mod's id (default: manifest, then folder name)" },
+      { flags: "--version <v>", description: "publish: the mod's version" },
+      { flags: "--folder <name>", description: "publish: the folder the game installs it into" },
+      { flags: "--part-name <text>", description: "publish: a readable name for the part" },
+      { flags: "--about <text>", description: "create/settings/publish: a description" },
+      { flags: "--notice <text>", description: "publish: a notice shown with the mod (credits, licences)" },
+      { flags: "--block <exts>", description: "create/settings: more file types to refuse" },
+      { flags: "--max-files <n>", description: "create/settings: most files in a part" },
+      { flags: "--max-ratio <n>", description: "create/settings: how many times its size a part may unpack to" },
+      { flags: "--max-parts <n>", description: "create/settings: most parts in a mod" },
+      { flags: "--expires <date>", description: "builds: when a registered build stops working" },
+      { flags: "--all", description: "list: every mod in the repository (owner)" },
+      { flags: "--as-owner", description: "remove: as the repository's owner, any mod" },
+      { flags: "--disable", description: "settings: stop serving and taking uploads" },
+      { flags: "--enable", description: "settings: start again" },
+      { flags: "--undo", description: "block: let the uploader back in" },
+      { flags: "-y, --yes", description: "remove/delete: without asking" },
+      { flags: "--no-wait", description: "publish: do not wait for the checks" },
+      { flags: "--take-down", description: "block: also hide the uploader's mods" },
+    ],
+    examples: [
+      'cbx mods create my-game --name "My Game" --allow .png,.ogg,.json --nested .pak',
+      "cbx mods builds my-game --register release/build-secret.bin",
+      "cbx mods publish ./mods/BetterTrees --repo my-game",
+      "cbx mods list my-game",
+      "cbx mods publish ./HD-Art --repo zt1 --part animals",
+    ],
+    run: commandMods,
+  },
+  {
     name: "issues",
-    group: "Your projects",
+    group: "Issues",
     summary: "issues on a project, or open one",
     usage: "issues [project]",
     detail:
@@ -3289,11 +3816,70 @@ const SPECS: CommandSpec[] = [
     run: commandIssues,
   },
   {
+    name: "issue",
+    group: "Issues",
+    summary: "read, answer, close, label or assign one issue; labels and rules",
+    usage:
+      "issue view|comment|close|reopen|label|assign <number> … | issue labels [add|change|remove <name>] | issue rules [add <kind> | on|off|change|remove <n>]",
+    brief: "issue <action> [number]",
+    detail:
+      "Closing says why: completed (the default), --reason not-planned, or\n" +
+      "--duplicate-of <n>. Labels and assignment need write access; replying\n" +
+      "needs only read access, as on the website.\n\n" +
+      "The project's labels and issue rules are the website's Settings → Issues.\n" +
+      "`issue labels` lists the labels; add, change and remove manage them.\n" +
+      "`issue rules` lists the rules, numbered; a rule is changed by its number.\n" +
+      "The kinds and what each takes:\n\n" +
+      "  auto-label   --words <a,b> --label <name> [--in title|body|both]\n" +
+      "  auto-assign  --assignees <a,b> [--label <name>]\n" +
+      "  welcome      -m <message>\n" +
+      "  stale        [--days <n>] [--close-after <n>] [--label] [-m] [--exempt <a,b>]\n\n" +
+      "Inside a run, CODEROOK_TOKEN and CODEROOK_PROJECT are set, so a workflow\n" +
+      "can comment on or label the issue that started it with no setup.",
+    options: [
+      { flags: "-m, --message <text>", description: "what to say (comment, a note when closing, a rule's message)" },
+      { flags: "--reason <completed|not-planned>", description: "why it is closed" },
+      { flags: "--duplicate-of <n>", description: "close as a duplicate of another issue" },
+      { flags: "--remove", description: "take the labels off instead" },
+      { flags: "--starter", description: "with labels: add the usual set" },
+      { flags: "--colour <hex>", description: "labels add/change: its colour, like d73a4a" },
+      { flags: "--description <text>", description: "labels add/change: what it is for" },
+      { flags: "--name <text>", description: "labels change: rename it" },
+      { flags: "--words <a,b>", description: "rules: words that earn the label (auto-label)" },
+      { flags: "--label <name>", description: "rules: the label to add, or to act on" },
+      { flags: "--in <where>", description: "rules: title, body or both (auto-label)" },
+      { flags: "--assignees <a,b>", description: "rules: who to assign (auto-assign)" },
+      { flags: "--days <n>", description: "rules: quiet days before an issue is stale" },
+      { flags: "--close-after <n>", description: "rules: days after that before it is closed" },
+      { flags: "--exempt <a,b>", description: "rules: labels that keep an issue from going stale" },
+      { flags: "--project <name>", description: "which project" },
+    ],
+    examples: [
+      "cbx issue view 12",
+      'cbx issue comment 12 -m "Fixed in v41"',
+      "cbx issue close 12 --duplicate-of 9",
+      "cbx issue label 12 bug,ui",
+      "cbx issue assign 12 sam",
+      "cbx issue labels --starter",
+      'cbx issue labels add crash --colour d73a4a --description "It falls over"',
+      "cbx issue labels remove wontfix",
+      "cbx issue rules add auto-label --words crash,freeze --label crash",
+      'cbx issue rules add welcome -m "Thanks — we read every report."',
+      "cbx issue rules off 2",
+    ],
+    run: commandIssue,
+  },
+  {
     name: "releases",
     aliases: ["tags"],
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "what has been released, and its files",
     usage: "releases [project]",
+    detail:
+      "Each release with its files and who can take them: public (source and\n" +
+      "downloads), downloads public (the source stays private) or private.\n" +
+      "For a public project it also prints the addresses an app or a script\n" +
+      "reads them from, which need no account.",
     run: commandReleases,
   },
   {
@@ -3305,7 +3891,7 @@ const SPECS: CommandSpec[] = [
     */
     name: "hooks",
     aliases: ["webhooks"],
-    group: "Your projects",
+    group: "Project settings",
     summary: "where this project tells something else what happened",
     usage: "hooks [project]",
     detail:
@@ -3313,18 +3899,34 @@ const SPECS: CommandSpec[] = [
       "The signing secret is generated by the service and shown once, when\n" +
       "the hook is added — no route hands it back afterwards.\n\n" +
       "Events: version.published, merge.opened, merge.applied, merge.cancelled,\n" +
-      "check.reported, change_request.opened, change_request.reviewed.\n" +
-      "Naming none of them sends all of them.",
+      "check.reported, change_request.opened, change_request.reviewed,\n" +
+      "issue.opened, issue.closed, issue.reopened, issue.commented,\n" +
+      "issue.labeled, run.finished, run.failed, release.published.\n" +
+      "Naming none of them sends all of them.\n\n" +
+      "A hook is named by its id or its address. With only one hook on the\n" +
+      "project, --test, --deliveries, --redeliver and --on need no name.\n" +
+      "Twenty failures in a row switch a hook off; --on switches it back on\n" +
+      "with a clean count.",
     options: [
       { flags: "--add <url>", description: "notify this address; https only" },
-      { flags: "--events <a,b>", description: "only these, comma separated" },
+      { flags: "--events <a,b>", description: "only these, comma separated (with --hook: change them; all for every one)" },
       { flags: "--remove <id>", description: "stop notifying it" },
+      { flags: "--hook <id>", description: "which hook --events or --redeliver is about" },
+      { flags: "--test [id]", description: "send a signed ping now and say how it was answered" },
+      { flags: "--deliveries [id]", description: "the most recent deliveries and how each went" },
+      { flags: "--redeliver <delivery>", description: "send a delivery again (the start of its id is enough)" },
+      { flags: "--on [id]", description: "switch a hook that was switched off back on" },
       { flags: "--project <name>", description: "which project" },
     ],
     examples: [
       "cbx hooks",
       "cbx hooks --add https://example.com/coderook",
       "cbx hooks --add https://example.com/builds --events version.published",
+      "cbx hooks --test",
+      "cbx hooks --deliveries 3f2a9c10-…",
+      "cbx hooks --redeliver 7b1e04aa --hook 3f2a9c10-…",
+      "cbx hooks --hook 3f2a9c10-… --events release.published,run.failed",
+      "cbx hooks --on 3f2a9c10-…",
     ],
     run: commandHooks,
   },
@@ -3337,7 +3939,7 @@ const SPECS: CommandSpec[] = [
       This moves the project.
     */
     name: "undo",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "put the project back on an earlier save",
     usage: "undo [n] [project]",
     detail:
@@ -3357,7 +3959,7 @@ const SPECS: CommandSpec[] = [
       actually offers.
     */
     name: "promote",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "turn a commit into a version people can fetch",
     usage: "promote [n] [project]",
     detail:
@@ -3394,7 +3996,7 @@ const SPECS: CommandSpec[] = [
       hides it, labels it — which is what it does anyway.
     */
     name: "attach",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "put a file people can download on a version",
     usage: "attach <file> [n] [project]",
     detail:
@@ -3420,7 +4022,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "notes",
     aliases: ["release-notes"],
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "read or write what a version says about itself",
     usage: "notes [n] [project]",
     detail:
@@ -3449,7 +4051,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "mark",
     aliases: ["set"],
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "name, hide, pin or label one save",
     usage: "mark [n] [project]",
     detail:
@@ -3482,9 +4084,10 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "labels",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "the labels this project puts on versions",
     usage: "labels [list|add|remove] [name] [colour]",
+    brief: "labels [list|add|remove]",
     detail:
       "A label is a name and a colour. Put as many on a version as you like —\n" +
       "how you group and colour your own history is yours to decide.",
@@ -3499,7 +4102,7 @@ const SPECS: CommandSpec[] = [
   {
     name: "held",
     aliases: ["waiting"],
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "versions waiting for somebody to approve them",
     usage: "held [project]",
     detail:
@@ -3510,9 +4113,10 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "review",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "accept a held version, or turn it down",
     usage: "review <n> --approve | --decline",
+    brief: "review <n> --approve|--decline",
     options: [
       {
         flags: "--approve",
@@ -3534,7 +4138,7 @@ const SPECS: CommandSpec[] = [
       saying what was removed and by whom.
     */
     name: "take-down",
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "remove a version's files, for something published by mistake",
     usage: "take-down <n> --yes",
     detail:
@@ -3555,7 +4159,7 @@ const SPECS: CommandSpec[] = [
     */
     name: "release",
     aliases: ["tag"],
-    group: "Your projects",
+    group: "Versions and releases",
     summary: "give a version a name, so people know which one to fetch",
     usage: "release <name> [project]",
     detail:
@@ -3563,21 +4167,127 @@ const SPECS: CommandSpec[] = [
       "Nothing is uploaded: a release is a version with a name on it, so the\n" +
       "version has to exist already.\n\n" +
       "The same thing happens when a git tag is pushed to a CodeRook remote —\n" +
-      "`git push cbx v1.0` and `cbx release v1.0` are one action.",
+      "`git push cbx v1.0` and `cbx release v1.0` are one action.\n\n" +
+      "Put the installers on it with `cbx attach`. In a public project,\n" +
+      "--downloads public offers the release's notes, attachments and update\n" +
+      "feed to anybody while the version's source stays private, so one\n" +
+      "project can ship its own app without a second, public project for the\n" +
+      "installers. Without a name, --downloads changes an existing release.",
     options: [
       { flags: "--version <n>", description: "name this version instead of the newest" },
       { flags: "--notes <text>", description: "what changed, for the release page" },
+      { flags: "--generate-notes", description: "write the notes from what changed since the last release" },
+      { flags: "--draft", description: "save it as a draft: nothing is public until cbx release publish" },
+      { flags: "--prerelease", description: "keep it off the default update feed" },
+      { flags: "--channel <name>", description: "the update channel, like beta or nightly (stable by default)" },
+      { flags: "--downloads <public|private>", description: "who can take what is attached, apart from the source" },
     ],
     examples: [
       "cbx release v1.0",
+      "cbx release v2.0 --draft --generate-notes",
+      "cbx release publish --version 41",
+      "cbx release v2.1.0-beta.1 --prerelease --channel beta",
       'cbx release v1.2 --version 41 --notes "Fixes the export dialog"',
+      "cbx release 1.4.0 --downloads public",
+      "cbx release --downloads private --version 41",
     ],
     run: commandRelease,
   },
   {
+    name: "fork",
+    group: "Project settings",
+    summary: "your own copy of somebody's project, and offering work back",
+    usage: "fork <owner/project> [--name <slug>] | fork offer [line] --title <text> | fork sync",
+    brief: "fork <owner/project>",
+    detail:
+      "A fork is a private project under your account with the original's latest\n" +
+      "public version (its private files left out). Nothing is uploaded again.\n\n" +
+      "Inside a fork, `cbx fork offer <line>` offers that line to the original as\n" +
+      "a pull request (offered again, the same pull request moves to your newest\n" +
+      "save). Its runs there wait for the project's approval and get none of its\n" +
+      "secrets. `cbx fork sync` brings the original's latest into an `upstream`\n" +
+      "line of your fork, to merge when you choose.",
+    options: [
+      { flags: "--name <slug>", description: "what to call your copy" },
+      { flags: "--title <text>", description: "offer: the pull request's title" },
+      { flags: "--body <text>", description: "offer: its description" },
+      { flags: "--project <name>", description: "offer/sync: which fork" },
+    ],
+    examples: ["cbx fork sam/editor", 'cbx fork offer fix-export --title "Fix the export dialog"', "cbx fork sync"],
+    run: commandFork,
+  },
+  {
+    name: "security",
+    group: "Project settings",
+    summary: "report a vulnerability privately, handle reports, set the policy",
+    usage:
+      "security report <owner/project> --title <text> | security list | view|reply|mark S-<n> | security policy [--on|--off] [--text <file>]",
+    brief: "security <action> [S-n]",
+    detail:
+      "A report is seen only by the project's owner and admins, and by whoever\n" +
+      "sent it. Please use this rather than a public issue for anything that\n" +
+      "could hurt people using the project.\n\n" +
+      "`security policy` shows whether the project takes private reports and\n" +
+      "what it tells people about sending one (the website's Settings →\n" +
+      "Security). --text reads a file when one by that name exists, and uses\n" +
+      "the words themselves otherwise. Owners and admins change it.",
+    options: [
+      { flags: "--title <text>", description: "report: what is wrong" },
+      { flags: "--body <text>", description: "report: details and how to reproduce it" },
+      { flags: "--severity <level>", description: "report: low, medium, high or critical" },
+      { flags: "-m, --message <text>", description: "reply: what to say" },
+      { flags: "--on", description: "policy: take private reports" },
+      { flags: "--off", description: "policy: stop taking them" },
+      { flags: "--text <file or text>", description: "policy: the reporting policy" },
+      { flags: "--clear", description: "policy: remove the written policy" },
+      { flags: "--project <name>", description: "list/view/reply/mark/policy: which project" },
+    ],
+    examples: [
+      'cbx security report sam/editor --title "Path traversal in export" --severity high',
+      "cbx security list",
+      'cbx security reply S-3 -m "Confirmed; fix in 2.0.1"',
+      "cbx security mark S-3 fixed",
+      "cbx security policy",
+      "cbx security policy --on --text SECURITY.md",
+    ],
+    run: commandSecurity,
+  },
+  {
+    name: "verify",
+    group: "Versions and releases",
+    summary: "check a download against its release's signed manifest",
+    usage: "verify <owner/project> <release> <file…>",
+    brief: "verify <owner/project> …",
+    detail:
+      "Every public release has a manifest listing each file with its size and\n" +
+      "SHA-256, signed with CodeRook's release key. This checks the signature,\n" +
+      "then the files you downloaded. A mismatch means do not run it.",
+    options: [{ flags: "--key <base64>", description: "pin the release key instead of the one cbx knows" }],
+    examples: ["cbx verify sam/editor v2.0.0 ./editor-setup.exe"],
+    run: commandVerify,
+  },
+  {
+    name: "deps",
+    group: "Versions and releases",
+    summary: "known vulnerabilities in a save's dependencies",
+    usage: "deps [version]",
+    detail:
+      "Reads the lockfiles in the save (package-lock.json, yarn.lock,\n" +
+      "requirements.txt, poetry.lock, Pipfile.lock, Cargo.lock, go.sum,\n" +
+      "composer.lock, Gemfile.lock) and asks OSV about every pinned version.\n" +
+      "Only names and versions are sent, never code. Pull requests carry the\n" +
+      "same answer as the coderook/dependencies check.",
+    options: [
+      { flags: "--fresh", description: "ask OSV again rather than reading the kept report" },
+      { flags: "--project <name>", description: "which project" },
+    ],
+    examples: ["cbx deps", "cbx deps 41 --fresh"],
+    run: commandDeps,
+  },
+  {
     name: "actions",
     aliases: ["workflows"],
-    group: "Your projects",
+    group: "Actions and builds",
     summary: "the automations a project has",
     usage: "actions [project]",
     detail:
@@ -3587,7 +4297,10 @@ const SPECS: CommandSpec[] = [
       "ran against, so a passing build becomes a download without anybody\n" +
       "opening the website. --ship turns that on for one action.\n\n" +
       "Attaching is publishing: what an action ships onto a public version\n" +
-      "is a download anybody can take, from the moment the run passes.",
+      "is a download anybody can take, from the moment the run passes.\n\n" +
+      "cbx actions check [files…] checks workflow files (.rook/workflows)\n" +
+      "before you save them. cbx actions set <action> changes one made on the\n" +
+      "website: --schedule, --timeout, --approval, --concurrency.",
     options: [
       { flags: "--ship <action>", description: "its builds become downloads on the version" },
       { flags: "--no-ship <action>", description: "keep its files without attaching them" },
@@ -3595,9 +4308,18 @@ const SPECS: CommandSpec[] = [
       { flags: "--on-proposal <action>", description: "run it on proposals; its result becomes a check" },
       { flags: "--by-hand <action>", description: "run it only when somebody starts it" },
       { flags: "--project <name>", description: "which project" },
+      { flags: "--schedule <cron>", description: "with set: run it on a schedule (UTC); off to stop" },
+      { flags: "--timeout <minutes>", description: "with set: stop a run that takes longer; off to stop" },
+      { flags: "--approval <on|off>", description: "with set: each run waits for somebody to approve it" },
+      { flags: "--concurrency <group>", description: "with set: one run of the group at a time; off to stop" },
+      { flags: "--cancel-old", description: "with set: a new run cancels the group's older ones" },
+      { flags: "--keep-old", description: "with set: a new run waits its turn" },
     ],
     examples: [
       "cbx actions",
+      "cbx actions check",
+      'cbx actions set "Nightly" --schedule "0 3 * * *" --timeout 30',
+      'cbx actions set Deploy --approval on --concurrency deploy --cancel-old',
       'cbx actions --ship "Windows installer"',
       'cbx actions --no-ship "Windows installer"',
       'cbx actions --on-proposal Tests',
@@ -3605,8 +4327,114 @@ const SPECS: CommandSpec[] = [
     run: commandWorkflows,
   },
   {
+    name: "pr",
+    group: "Lines, merges and pull requests",
+    summary: "pull requests: list, read, review, comment, merge",
+    usage: "pr <list|view|files|comment|approve|request-changes|ask|label|title|ready|draft|retarget|close|reopen|merge> [M-3] …",
+    brief: "pr <action> [M-3]",
+    detail:
+      "A pull request is a line offered to another line (cbx propose opens one).\n" +
+      "This is the Pull requests tab of the website, from here:\n\n" +
+      "  list [--all|--state merged] [--mine] [--label bug]   the project's pull requests\n" +
+      "  view M-3                       description, reviews, checks, conversation, blockers\n" +
+      "  files M-3                      what it changes\n" +
+      "  comment M-3 -m \"…\" [--line path:12]   a comment, or one on a line\n" +
+      "  approve M-3 [-m \"…\"]           approve it\n" +
+      "  request-changes M-3 -m \"…\"     ask for changes\n" +
+      "  ask M-3 sam,priya              ask people to review it\n" +
+      "  label M-3 bug,ui               set its labels\n" +
+      "  title M-3 \"New title\"          rename it\n" +
+      "  ready M-3 | draft M-3          ready for review, or back to draft\n" +
+      "  retarget M-3 release           land it on another line\n" +
+      "  close M-3 | reopen M-3         close without merging, or reopen\n" +
+      "  merge M-3                      merge it, once nothing stands in the way\n\n" +
+      "An approval stops counting when new saves land on the line: it was of the\n" +
+      "code somebody looked at. A draft cannot be merged until it is marked ready.",
+    options: [
+      { flags: "-m, --message <text>", description: "comment, review or title text" },
+      { flags: "--line <path:line>", description: "comment: on this line of a changed file" },
+      { flags: "--project <project>", description: "a project other than this folder's" },
+      { flags: "--state <state>", description: "list: open, merged, closed or all" },
+      { flags: "--label <name>", description: "list: only those with this label" },
+      { flags: "--author <username>", description: "list: only those opened by this person" },
+      { flags: "--all", description: "list: every state" },
+      { flags: "--mine", description: "list: only those waiting on your review" },
+      { flags: "--squash", description: "merge / auto-merge: land as one save, without the line's own saves" },
+      { flags: "--off", description: "auto-merge: stop waiting to merge by itself" },
+    ],
+    examples: [
+      "cbx pr list",
+      "cbx pr view M-3",
+      'cbx pr comment M-3 --line src/app.ts:42 -m "This can be null"',
+      "cbx pr approve M-3",
+      "cbx pr merge M-3",
+      "cbx pr merge M-3 --squash",
+      "cbx pr auto-merge M-3",
+    ],
+    run: commandPr,
+  },
+  {
+    name: "cancel",
+    group: "Actions and builds",
+    summary: "stop a run that is waiting or working",
+    usage: "cancel <number> [project]",
+    detail:
+      "Marks the run cancelled at once. A runner working on it is told at its next\n" +
+      "heartbeat and stops the work, including anything the command started.",
+    examples: ["cbx cancel 12"],
+    run: commandCancel,
+  },
+  {
+    name: "rerun",
+    group: "Actions and builds",
+    summary: "run a finished run again",
+    usage: "rerun <number> [project]",
+    detail:
+      "Queues the same action against the same save. When the run was checking a\n" +
+      "pull request that is still open, its check goes back to waiting.",
+    examples: ["cbx rerun 12"],
+    run: commandRerun,
+  },
+  {
+    name: "approve",
+    group: "Actions and builds",
+    summary: "let a run that waits for approval start",
+    usage: "approve <number> [project]",
+    detail:
+      "An action marked as needing approval (often one that publishes) waits\n" +
+      "after it is set off until somebody who can change the project approves it.",
+    examples: ["cbx approve 12"],
+    run: commandApprove,
+  },
+  {
+    name: "secret",
+    aliases: ["secrets"],
+    group: "Project settings",
+    summary: "values runs need that must not be in the files",
+    usage: "secret list | set <NAME> | remove <NAME>",
+    brief: "secret list|set|remove [NAME]",
+    detail:
+      "A secret is handed to each run as an environment variable of the same\n" +
+      "name, but only to runs started by people who can change the project.\n" +
+      "Run logs show *** in its place. Its value is never shown again.\n\n" +
+      "The value is read from what is piped in, from another variable with\n" +
+      "--from-env, or typed at a hidden prompt; never from an argument, which\n" +
+      "would stay in your shell history.",
+    options: [
+      { flags: "--from-env <VAR>", description: "take the value from this environment variable" },
+      { flags: "--project <name>", description: "which project" },
+    ],
+    examples: [
+      "cbx secret list",
+      "cbx secret set DEPLOY_TOKEN",
+      "cbx secret set SIGNING_KEY < key.pem",
+      "cbx secret remove DEPLOY_TOKEN",
+    ],
+    run: commandSecret,
+  },
+  {
     name: "runs",
-    group: "Actions",
+    group: "Actions and builds",
     summary: "what has run, and how it went",
     usage: "runs [project]",
     detail:
@@ -3624,7 +4452,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "logs",
-    group: "Actions",
+    group: "Actions and builds",
     summary: "what one run printed",
     usage: "logs <number> [project]",
     detail:
@@ -3632,11 +4460,12 @@ const SPECS: CommandSpec[] = [
       "stderr is shown in red. Exits 1 when the run failed, so this can be\n" +
       "the last line of a script.",
     examples: ["cbx logs 12", "cbx logs #12 my-project"],
+    options: [{ flags: "--follow", description: "keep printing as it runs, until it ends" }],
     run: commandLogs,
   },
   {
     name: "delete",
-    group: "Your projects",
+    group: "Project settings",
     summary: "delete a project",
     usage: "delete [project]",
     detail:
@@ -3649,33 +4478,48 @@ const SPECS: CommandSpec[] = [
   {
     name: "people",
     aliases: ["collaborators"],
-    group: "People",
-    summary: "who can reach a project, and invite somebody",
+    group: "Project settings",
+    summary: "who can reach a project: invite, change a role, remove",
     usage: "people [project]",
+    detail:
+      "Lists the project's people and the invites waiting on a reply. Somebody\n" +
+      "is named by their email address or display name, as the list shows them.\n" +
+      "Only the project's owner and admins can see the list or change it.",
     options: [
       { flags: "--invite <email>", description: "ask somebody to join" },
-      { flags: "--role <role>", description: "what they may do (default member)" },
+      { flags: "--role <role>", description: "write, read or admin (default write when inviting)" },
+      { flags: "--change <who>", description: "give one of the project's people the --role named" },
+      { flags: "--remove <who>", description: "take somebody off the project" },
+      { flags: "--cancel-invite <email>", description: "withdraw an invite nobody has accepted" },
+      { flags: "--accept <link>", description: "join a project you were invited to" },
     ],
-    examples: ["cbx people my-project --invite sam@example.com"],
+    examples: [
+      "cbx people my-project --invite sam@example.com",
+      "cbx people --change sam@example.com --role admin",
+      "cbx people --remove sam@example.com",
+      "cbx people --accept https://coderook.com/?invite=…",
+    ],
     run: commandCollaborators,
   },
   {
     name: "watch",
-    group: "People",
+    group: "Project settings",
     summary: "what reaches you about a project",
     usage: "watch [project] [--level versions]",
+    brief: "watch [project]",
     options: [
       {
         flags: "--level <level>",
         description: "everything, versions, issues, releases, ignore",
       },
       { flags: "--email [off]", description: "include it in the daily email" },
+      { flags: "--discussions <all|off>", description: "whether workspace messages reach your notifications" },
     ],
     run: commandWatch,
   },
   {
     name: "tokens",
-    group: "Other",
+    group: "For assistants",
     summary: "the tokens that can act as your account",
     usage: "tokens",
     detail:
@@ -3687,9 +4531,10 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "propose",
-    group: "Working with a folder",
+    group: "Lines, merges and pull requests",
     summary: "offer this folder's line to main",
     usage: 'propose -m "title" [--into main] [--body text] [folder]',
+    brief: "propose -m \"title\" [folder]",
     options: [
       { flags: "-m, --message <text>", description: "the proposal's title" },
       { flags: "--into <line>", description: "the line to propose into (default main)" },
@@ -3705,7 +4550,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "proposals",
-    group: "Working with a folder",
+    group: "Lines, merges and pull requests",
     summary: "open proposals on this project",
     usage: "proposals [--all] [folder]",
     options: [{ flags: "--all", description: "include merged and cancelled ones" }],
@@ -3713,7 +4558,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "merges",
-    group: "When somebody saved first",
+    group: "Lines, merges and pull requests",
     summary: "this folder's uploads waiting on a decision",
     usage: "merges [folder]",
     detail:
@@ -3723,7 +4568,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "merge",
-    group: "When somebody saved first",
+    group: "Lines, merges and pull requests",
     summary: "merge a line here, or decide one waiting on CodeRook",
     usage: "merge <line | ref>",
     detail:
@@ -3748,21 +4593,21 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "bundle",
-    group: "Bundles",
+    group: "Mods and bundles",
     summary: "pack the project as a .cbx",
     usage: "bundle [folder] [out]",
     run: commandBundle,
   },
   {
     name: "unbundle",
-    group: "Bundles",
+    group: "Mods and bundles",
     summary: "extract a .cbx",
     usage: "unbundle <file> [dir]",
     run: commandUnbundle,
   },
   {
     name: "inspect",
-    group: "Bundles",
+    group: "Mods and bundles",
     summary: "what a .cbx contains",
     usage: "inspect <file>",
     options: [{ flags: "--files", description: "list every file inside" }],
@@ -3770,7 +4615,7 @@ const SPECS: CommandSpec[] = [
   },
   {
     name: "runner",
-    group: "Actions",
+    group: "Actions and builds",
     summary: "take this project's runs and do them here",
     usage: "runner <project>",
     detail:
@@ -3793,7 +4638,7 @@ const SPECS: CommandSpec[] = [
       is a file in a folder, and this already knows where the folder is.
     */
     name: "skill",
-    group: "Other",
+    group: "For assistants",
     summary: "teach Claude Code about CodeRook",
     usage: "skill [--project]",
     detail:
@@ -3826,9 +4671,10 @@ const SPECS: CommandSpec[] = [
       stdin and stdout, and exits with them.
     */
     name: "mcp",
-    group: "Other",
+    group: "For assistants",
     summary: "serve CodeRook to Claude Code, Codex and other assistants",
-    usage: "mcp",
+    usage: "mcp [--workspaces]",
+    options: [{flags:"--workspaces",description:"opt into the remote connector's write/run/deploy tools and workspace permissions"}],
     detail:
       "Speaks the Model Context Protocol on stdin and stdout, so an assistant\n" +
       "can look at your projects while it works. Not run by hand — point the\n" +
@@ -3850,11 +4696,29 @@ const SPECS: CommandSpec[] = [
       "A project whose owner has turned off machine reading is refused, in\n" +
       "words rather than as a status code.\n",
     examples: ["claude mcp add coderook -- cbx mcp"],
-    run: () => commandMcp(VERSION),
+    run: parsed => parsed.flags.has("workspaces") ? commandWorkspaceMcp() : commandMcp(VERSION),
+  },
+  {
+    name: "update",
+    aliases: ["upgrade"],
+    group: "Getting started",
+    summary: "install the newest cbx",
+    usage: "update",
+    options: [
+      { flags: "--check", description: "only say whether a newer cbx is out" },
+    ],
+    detail:
+      "Updates cbx itself, not a folder: `cbx get` brings a project's files\n" +
+      "up to date. Asks the npm registry for the newest @coderook/cli and\n" +
+      "installs it the way this copy was installed: globally with npm, or in\n" +
+      "the project whose packages hold it. Through npx there is nothing to\n" +
+      "install. Your folders, sign-in and settings are left as they are.",
+    examples: ["cbx update", "cbx update --check"],
+    run: parsed => commandUpdate(parsed.flags),
   },
   {
     name: "doctor",
-    group: "Other",
+    group: "Getting started",
     summary: "check the service, config and sign-in",
     usage: "doctor",
     run: () => commandDoctor(),
@@ -3887,9 +4751,10 @@ function localTwin(
 
 SPECS.push({
   name: "build",
-  group: "Actions",
+  group: "Actions and builds",
   summary: "build executables for Windows, Linux and macOS on this machine",
   usage: "build [folder] [--target win,linux,mac]",
+  brief: "build [folder] [--target …]",
   detail:
     "Builds the project in this folder for each target, using whatever this\n" +
     "machine has: Go, Bun, Deno and .NET build every platform from any one;\n" +
@@ -3902,6 +4767,7 @@ SPECS.push({
     "a command of your own, describe the build in coderook.build.json\n" +
     "(cbx build init writes one), which is saved with the project.",
   options: [
+      { flags: "--docker", description: "allow a Docker container as a last resort (never used otherwise)" },
     { flags: "-t, --target <list>", description: "windows-x64, linux-arm64, macos-arm64 … or win, linux, mac, all" },
     { flags: "--plan", description: "say how each target would be built, build nothing" },
     { flags: "--preset <name>", description: "go, bun, deno, rust, dotnet, electron, pyinstaller, python or custom" },
@@ -3957,7 +4823,8 @@ SPECS.push(
   ),
 );
 
-const REGISTRY = buildRegistry(SPECS);
+/* Exported for the help test (test/help_listing.test.ts); nothing else imports this file. */
+export const REGISTRY = buildRegistry(SPECS);
 
 async function main(argv: string[]): Promise<number> {
   const old = nodeTooOld();
@@ -4013,7 +4880,11 @@ async function main(argv: string[]): Promise<number> {
     );
   }
 
-  return spec.run(parse(rest, spec));
+  const parsed = parse(rest, spec);
+  const code = await spec.run(parsed);
+  /* One line when a workspace thread has unread messages: terminals only, at most every few minutes. */
+  await unreadReminder(name, parsed);
+  return code;
 }
 
 /**
@@ -4028,10 +4899,20 @@ function leave(code: number): void {
   process.exitCode = code;
 }
 
-tuneNetwork();
-main(process.argv.slice(2))
-  .then(leave)
-  .catch((error: unknown) => {
-    console.error(red(describeError(error)));
-    leave(1);
-  });
+/*
+  Run only when started as the program. A test loads this file to read the
+  command table — that every command is listed once, and fits — and must not
+  find itself running a command with the test runner's own arguments.
+*/
+/** Run the command line with this process's arguments. bin.ts calls this for everything it does not answer itself. */
+export function start(): void {
+  tuneNetwork();
+  main(process.argv.slice(2))
+    .then(leave)
+    .catch((error: unknown) => {
+      console.error(red(describeError(error)));
+      leave(1);
+    });
+}
+
+if (require.main === module) start();

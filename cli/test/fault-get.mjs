@@ -101,7 +101,8 @@ async function behindFolder(name) {
 }
 
 const complete = (folder) => {
-  const held = readdirSync(folder).sort().join(",");
+  /* .coderook is the folder's own copy of its link (config.ts), not project content. */
+  const held = readdirSync(folder).filter((name) => name !== ".coderook").sort().join(",");
   const changed = existsSync(path.join(folder, "changed.txt"))
     ? readFileSync(path.join(folder, "changed.txt"), "utf8").trim()
     : null;
@@ -155,16 +156,34 @@ for (const point of POINTS) {
   An edit made while the fetch was stopped is the one thing completing it
   must not bury: it exists only on this disk, and the interrupted run has no
   claim on it.
+
+  To a file the version leaves alone (steady.txt), finishing cannot bury it,
+  so the resume goes ahead and keeps it, as an ordinary fetch would. To a file
+  the version changes (changed.txt), finishing would, so it stops and says so.
 */
 {
   const w = await behindFolder("gap");
   rook(root, w.home, ["get", w.folder], "get:after-first-file");
   writeFileSync(path.join(w.folder, "steady.txt"), "edited while it was stopped\n");
   const resumed = rook(root, w.home, ["get", w.folder]);
-  record("an edit made during the interruption stops the resume",
-    resumed.code !== 0 && resumed.out.includes("steady.txt"), resumed.out.trim());
+  record("an edit to a file the version leaves alone does not stop the resume",
+    resumed.code === 0, resumed.out.trim());
   record("and that edit is still on disk",
     readFileSync(path.join(w.folder, "steady.txt"), "utf8").trim() ===
+      "edited while it was stopped");
+  const after = complete(w.folder);
+  record("and the fetch still lands on the new version",
+    after.held === NEW.held && after.changed === NEW.changed, describe(after));
+}
+{
+  const w = await behindFolder("gapclash");
+  rook(root, w.home, ["get", w.folder], "get:after-staging");
+  writeFileSync(path.join(w.folder, "changed.txt"), "edited while it was stopped\n");
+  const resumed = rook(root, w.home, ["get", w.folder]);
+  record("an edit to a file the version changes stops the resume",
+    resumed.code !== 0 && resumed.out.includes("changed.txt"), resumed.out.trim());
+  record("and that edit is still on disk",
+    readFileSync(path.join(w.folder, "changed.txt"), "utf8").trim() ===
       "edited while it was stopped");
   const forced = rook(root, w.home, ["get", w.folder, "--replace"]);
   record("finishing it deliberately still works",

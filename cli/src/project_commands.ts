@@ -15,21 +15,15 @@ import {
   aiAccess,
   findProject,
   findPublicProject,
-  setAiAccess,
   updateProject,
   versions,
   whoami,
   type AccountProject,
-  type AiAccess,
 } from "./api.js";
 import { readLink, siteOrigin } from "./config.js";
 import type { Parsed } from "./registry.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
 
 function bytes(value: number): string {
   if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
@@ -46,7 +40,8 @@ function bytes(value: number): string {
  * its name every time.
  */
 export async function resolveProject(reference: string | undefined) {
-  const wanted = reference ?? (await readLink(process.cwd()))?.slug;
+  /* Inside a run, the project it is running for (CODEROOK_PROJECT, handed to every run). */
+  const wanted = reference ?? (await readLink(process.cwd()))?.slug ?? process.env.CODEROOK_PROJECT?.trim();
   if (!wanted) {
     console.error(
       red("Which project? Name one, or run this inside a linked folder."),
@@ -61,13 +56,19 @@ export async function resolveProject(reference: string | undefined) {
   return project;
 }
 
-/** The four answers, in the order the site shows them. */
+/** The answers, in the order the site shows them. */
 const AI_SWITCHES = [
   [
     "read",
     "aiRead",
     "Can AI read this?",
-    "reading, indexing, summarising and model training",
+    "reading, indexing, summarising and quoting in answers",
+  ],
+  [
+    "train",
+    "aiTrain",
+    "Can AI train on this?",
+    "using what it reads to train a model",
   ],
   [
     "download",
@@ -90,50 +91,59 @@ const AI_SWITCHES = [
 ] as const;
 
 /**
- * Show or change what a project says about machines.
+ * The flags `cbx ai` used to take, named when somebody types one.
  *
- * The one part of the product with no command at all. Showing is the default
- * because most of the time the question is "what is this set to", and a
- * command that needs arguments to answer that is one people stop using.
+ * Returned rather than printed so the refusal can be checked without a
+ * service: it must happen before anything is asked of one.
+ */
+export function aiChangeAttempted(parsed: Parsed): string[] {
+  return AI_SWITCHES.map(([name]) => name).filter((name) => parsed.flags.has(name));
+}
+
+/**
+ * Show what a project says about machines.
+ *
+ * Read only. What AI may do with a project is changed by a person, on the
+ * website or in the desktop app, and the service refuses the change from any
+ * token — which is what this tool, the MCP servers, runs and assistants all
+ * hold. An assistant able to switch off the rule that keeps it out would make
+ * the rule decoration, so the old switches are refused here, plainly, before
+ * anything is sent.
  */
 export async function commandAi(parsed: Parsed): Promise<number> {
+  const attempted = aiChangeAttempted(parsed);
+  if (attempted.length) {
+    console.error(
+      red(`AI access cannot be changed from the command line (${attempted.map((name) => "--" + name).join(", ")}).`),
+    );
+    console.error(
+      "A person changes it on the website, in the project's Settings → Access & AI, or in the desktop app.",
+    );
+    console.error(dim("  cbx ai shows what it is set to now."));
+    return 1;
+  }
+
   const project = await resolveProject(parsed.positional[0]);
   if (!project) return 1;
-
-  const change: Partial<AiAccess> = {};
-  for (const [name, field] of AI_SWITCHES) {
-    const value = parsed.flags.get(name);
-    if (value === undefined) continue;
-    /*
-      `--read off` and `--read=false` both read naturally, and a bare `--read`
-      means on, because that is what a flag without a value means everywhere
-      else in this tool.
-    */
-    const text = typeof value === "string" ? value.trim().toLowerCase() : "";
-    change[field] =
-      value === true ? true : !["off", "false", "no", "n", "0"].includes(text);
-  }
-
-  if (Object.keys(change).length) {
-    await setAiAccess(project.id, change);
-    console.log(green(`Updated ${project.name}.`));
-  }
 
   const access = await aiAccess(project.id);
   console.log("");
   console.log(bold(project.name));
-  for (const [name, field, question, meaning] of AI_SWITCHES) {
+  for (const [, field, question, meaning] of AI_SWITCHES) {
     const mark = access[field] ? green("allowed") : red("refused");
-    console.log(`  ${question.padEnd(30)} ${mark}  ${dim("--" + name)}`);
+    console.log(`  ${question.padEnd(30)} ${mark}`);
     console.log(`  ${dim(meaning)}`);
   }
   console.log("");
   console.log(
     dim(
-      "Everything is allowed until you say otherwise. Turning reading off is the",
+      "Everything but training is allowed until somebody says otherwise; training",
     ),
   );
-  console.log(dim("one that refuses model training."));
+  console.log(dim("is refused until the owner allows it, and reading off refuses it too."));
+  console.log(
+    dim("Change these on the website (Settings → Access & AI) or in the desktop app."),
+  );
   return 0;
 }
 
@@ -447,7 +457,7 @@ export async function commandVersions(parsed: Parsed): Promise<number> {
     ].filter(Boolean);
     console.log(
       `  ${accent(`v${version.sequence}`).padEnd(16)} ${when.padEnd(22)}` +
-        `${String(version.fileCount).padStart(5)} files  ${bytes(version.storedSize)}` +
+        `${String(version.fileCount).padStart(5)} ${version.fileCount === 1 ? "file " : "files"}  ${bytes(version.storedSize)}` +
         (marks.length ? `  ${marks.join(" ")}` : ""),
     );
     if (version.message) console.log(`    ${dim(version.message)}`);

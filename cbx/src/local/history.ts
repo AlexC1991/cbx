@@ -138,7 +138,7 @@ export async function save(
       previous: before,
       progress: options.progress,
     });
-    const tree = await repository.writeTree([...reading.files.values()]);
+    const tree = await repository.writeTree([...reading.files.values()], parent?.tree);
     await repository.writeIndex(reading.index);
     if (!merging && parent && parent.tree === tree) {
       return { saved: false, reason: "unchanged" } as const;
@@ -159,6 +159,14 @@ export async function save(
     });
     await repository.setLineTip(line, made.id);
     if (merging) await clearMergeState(repository);
+    /* The folder is what was just saved; said so, for the next quiet status. */
+    if (repository.objects.v2) {
+      await repository.writeIndex(reading.index, {
+        head: made.id,
+        clean: true,
+        complete: reading.index.size === reading.files.size,
+      });
+    }
     let bytes = 0;
     for (const file of reading.files.values()) bytes += file.size;
     return {
@@ -207,18 +215,38 @@ export type Status = {
 
 export async function status(repository: Repository): Promise<Status> {
   const { save: head, tree } = await headTree(repository);
-  const reading = await readFolder(repository, { store: false, previous: tree });
+  /* A report, not a save: the listing's sizes and times may stand in for a stat each. */
+  const reading = await readFolder(repository, { store: false, previous: tree, exact: false });
   /*
     Kept, so the next status does not hash the same files again. The index
     is only a cache: an entry this writes without objects makes a save read
-    that file once more, never trust something it has not stored.
+    that file once more, never trust something it has not stored. Written
+    only when it changed; rewriting it whole was a good part of a quiet status.
   */
-  await repository.writeIndex(reading.index);
   const merging = await readMergeState(repository);
+  const changes = compareTrees(byPath(tree), reading.files);
+  /*
+    And whether the folder is exactly the head, so the next quiet status can
+    be answered without Node (engine/src/quick.rs). Rewritten when what it
+    says changes, as well as when the index does.
+  */
+  const stamp = {
+    head: head?.id ?? null,
+    clean: !changeCount(changes) && !merging,
+    complete: reading.index.size === reading.files.size,
+  };
+  const told = repository.indexStamp;
+  if (
+    reading.indexChanged ||
+    (repository.objects.v2 &&
+      (told?.head !== stamp.head || told?.clean !== stamp.clean || (told?.complete === true) !== stamp.complete))
+  ) {
+    await repository.writeIndex(reading.index, stamp);
+  }
   return {
     line: await repository.currentLine(),
     head,
-    changes: compareTrees(byPath(tree), reading.files),
+    changes,
     ...(merging
       ? {
           merging: {

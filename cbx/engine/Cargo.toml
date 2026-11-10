@@ -1,0 +1,34 @@
+[package]
+name = "cbx-engine"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["ACCA Gaming Productions"]
+description = "The native byte engine for CBX: chunking, digests, object frames, the local store and byte-level deltas, with output identical to the TypeScript implementation."
+publish = false
+
+[lib]
+name = "cbx_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cbx-engine"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+zstd = "0.13"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: times read from the index must equal, to the last bit, what JavaScript wrote.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+rayon = "1"
+hex = "0.4"
+regex = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = false

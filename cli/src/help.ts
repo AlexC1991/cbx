@@ -14,42 +14,55 @@
  * afford whole sentences and examples.
  */
 
-import { GROUP_ORDER, type CommandSpec, type Registry } from "./registry.js";
+import { GROUP_ORDER, LISTING_ORDER, type CommandSpec, type Registry } from "./registry.js";
+import { accent, bold, dim } from "./colour.js";
 
-const bold = (value: string) => `[1m${value}[0m`;
-const dim = (value: string) => `[2m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
+/** The widest the usage column may be; a longer usage needs a `brief`. */
+export const USAGE_COLUMN = 30;
 
-/** Longest visible name, so the summary column lines up across every group. */
+/** What the command list shows in the usage column. */
+export const listedUsage = (spec: CommandSpec): string => spec.brief ?? spec.usage;
+
+/** Longest visible usage, so the summary column lines up across every group. */
 function nameColumn(specs: CommandSpec[]): number {
   return specs.reduce(
-    (widest, spec) => Math.max(widest, spec.usage.length),
+    (widest, spec) => Math.max(widest, listedUsage(spec).length),
     0,
   );
 }
 
+/** Where a command sits inside its group: by LISTING_ORDER, then as declared. */
+function rank(spec: CommandSpec, declared: number): number {
+  const at = LISTING_ORDER.indexOf(spec.name);
+  return at === -1 ? LISTING_ORDER.length + declared : at;
+}
+
 export function renderHelp(registry: Registry, version: string): string {
   const listed = registry.specs.filter((spec) => !spec.deprecatedBy);
-  const column = Math.min(nameColumn(listed), 34);
+  const column = Math.min(nameColumn(listed), USAGE_COLUMN);
   const lines: string[] = [
-    `${bold("cbx")} ${dim(version)} — the CodeBox engine, for CodeRook`,
+    `${bold("cbx")} ${dim(version)} — the CBX engine, for CodeRook`,
     "",
   ];
 
   for (const group of GROUP_ORDER) {
-    const inGroup = listed.filter((spec) => spec.group === group);
+    const inGroup = listed
+      .map((spec, declared) => ({ spec, order: rank(spec, declared) }))
+      .filter(({ spec }) => spec.group === group)
+      .sort((a, b) => a.order - b.order)
+      .map(({ spec }) => spec);
     if (!inGroup.length) continue;
     lines.push(bold(group));
     for (const spec of inGroup) {
-      lines.push(`  ${spec.usage.padEnd(column)}  ${spec.summary}`);
+      lines.push(`  ${listedUsage(spec).padEnd(column)}  ${spec.summary}`);
     }
     lines.push("");
   }
 
   lines.push(
-    dim("cbx help <command>   what one command does, in full"),
-    dim("CODEROOK_TOKEN is used when set, so automated runs need nothing on disk."),
-    dim("CODEROOK_API_URL points at another service."),
+    dim("cbx help <command>   the full usage, options and examples for one command"),
+    dim("CODEROOK_TOKEN       used instead of the stored sign-in, for automated runs"),
+    dim("CODEROOK_API_URL     point at another service"),
   );
   return lines.join("\n");
 }

@@ -167,15 +167,87 @@ export function ruleMatches(
   return relativePath.split("/").some((segment) => expression.test(segment));
 }
 
+/*
+  How each rule is asked, worked out once per list of rules.
+
+  A walk of a fourteen-thousand-file engine checkout spent twenty-eight of its
+  thirty-three seconds in `ruleMatches`: every path, and every folder above
+  it, tried every pattern against every one of its segments with a regular
+  expression. Most of those questions are the same question — whether a name
+  like `core` or `*.pfx` matches — asked thousands of times. A rule without a
+  slash only ever looks at single names, so its answer for a name is kept and
+  the regular expressions run once per distinct name instead of once per
+  path. The answers are exactly `ruleMatches`', just remembered.
+*/
+type RuleKind = "segment" | "ownName" | "wholePath";
+type RuleIndex = {
+  kinds: RuleKind[];
+  /** Positions of the rules that are asked about single names. */
+  named: number[];
+  /** For each name seen, the positions (into `rules`) of the named rules it matches. */
+  answers: Map<string, number[]>;
+};
+
+const NONE: number[] = [];
+const indexes = new WeakMap<Rule[], RuleIndex>();
+
+function indexFor(rules: Rule[]): RuleIndex {
+  let index = indexes.get(rules);
+  if (index) return index;
+  const kinds: RuleKind[] = rules.map((rule) => {
+    if (rule.directoryOnly) {
+      const bare = trailingSlashOff(rule.pattern);
+      return rule.anchored || bare.includes("/") ? "wholePath" : "ownName";
+    }
+    return rule.anchored || rule.pattern.includes("/") ? "wholePath" : "segment";
+  });
+  const named = kinds.flatMap((kind, at) => (kind === "wholePath" ? [] : [at]));
+  index = { kinds, named, answers: new Map() };
+  indexes.set(rules, index);
+  return index;
+}
+
+function namedMatches(index: RuleIndex, rules: Rule[], name: string): number[] {
+  let found = index.answers.get(name);
+  if (found) return found;
+  found = NONE;
+  for (const at of index.named) {
+    if (matcher(rules[at]!.pattern).test(name)) {
+      if (found === NONE) found = [];
+      found.push(at);
+    }
+  }
+  index.answers.set(name, found);
+  return found;
+}
+
 /** The last matching rule wins, as it does in gitignore. */
 export function lastMatchingRule(
   relativePath: string,
   isDirectory: boolean,
   rules: Rule[],
 ): Rule | null {
+  if (!rules.length) return null;
+  const index = indexFor(rules);
+  const segments = relativePath.split("/");
+  /* Which named rules some segment satisfies, and which the last one does. */
+  const anySegment = new Uint8Array(rules.length);
+  const ownName = new Uint8Array(rules.length);
+  for (let at = 0; at < segments.length; at += 1) {
+    const hits = namedMatches(index, rules, segments[at]!);
+    for (const hit of hits) anySegment[hit] = 1;
+    if (at === segments.length - 1) for (const hit of hits) ownName[hit] = 1;
+  }
   let found: Rule | null = null;
-  for (const rule of rules) {
-    if (ruleMatches(relativePath, isDirectory, rule)) found = rule;
+  for (let at = 0; at < rules.length; at += 1) {
+    const rule = rules[at]!;
+    const kind = index.kinds[at]!;
+    let matched: boolean;
+    if (kind === "segment") matched = anySegment[at] === 1;
+    else if (kind === "ownName") matched = isDirectory && ownName[at] === 1;
+    else if (rule.directoryOnly && !isDirectory) matched = false;
+    else matched = matcher(rule.pattern).test(relativePath);
+    if (matched) found = rule;
   }
   return found;
 }
@@ -292,8 +364,10 @@ export function excludes(
   relativePath: string,
   isDirectory: boolean,
   layers: RuleLayer[],
+  /* Folder answers to reuse; see FolderAnswers. Only for one fixed set of rules. */
+  remembered?: FolderAnswers,
 ): boolean {
-  const rule = decidingRule(relativePath, isDirectory, layers);
+  const rule = decidingRule(relativePath, isDirectory, layers, remembered);
   return Boolean(rule && !rule.negated);
 }
 

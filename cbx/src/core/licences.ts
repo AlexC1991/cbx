@@ -13,7 +13,7 @@
  * identifiers is a picker that makes people choose MIT out of recognition.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { LICENCE_TEXTS } from "./licence_texts";
@@ -320,6 +320,25 @@ export function detectLicence(text: string): string | null {
  *
  * Returns the licence written, or null when nothing was.
  */
+/*
+  The names a licence goes by, as a file or as a folder of them.
+
+  Only the exact name LICENSE was looked for, which missed nearly every way a
+  project actually carries its licence — LICENSE.md, LICENCE.txt, COPYING,
+  the LICENSE-MIT and LICENSE-APACHE pair, a licenses folder. Found by saving
+  a copy of Blender: its licences live in a folder called `license`, which on
+  Windows answers to "LICENSE" as well, so the check opened a directory and
+  the save failed. Had the folder been named anything else, the save would
+  have put an MIT licence beside Blender's GPL one.
+*/
+const LICENCE_NAME = /^(licen[cs]es?|copying|copyright|unlicen[cs]e)([-._ ].*)?$/i;
+
+/** The licence file or folder this folder already has, if any. */
+export async function existingLicence(folder: string): Promise<string | null> {
+  const names = await readdir(folder).catch(() => [] as string[]);
+  return names.find((name) => LICENCE_NAME.test(name)) ?? null;
+}
+
 export async function licenceNewProject(
   folder: string,
   holder: string,
@@ -331,9 +350,17 @@ export async function licenceNewProject(
     to ask.
   */
   if (skip || !holder.trim()) return null;
+  /* Any licence at all is somebody's decision, whatever it is called. */
+  if (await existingLicence(folder)) return null;
   const target = path.join(folder, LICENCE_FILE);
-  const already = await readFile(target, "utf8").catch(() => null);
-  if (already !== null) return null;
-  await writeFile(target, licenceText(DEFAULT_LICENCE, holder.trim()), "utf8");
+  /*
+    A nudge, never a reason to fail. A folder that cannot be written to is
+    saved without one, exactly as it would have been before this existed.
+  */
+  try {
+    await writeFile(target, licenceText(DEFAULT_LICENCE, holder.trim()), { encoding: "utf8", flag: "wx" });
+  } catch {
+    return null;
+  }
   return DEFAULT_LICENCE;
 }

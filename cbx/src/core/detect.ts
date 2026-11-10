@@ -151,7 +151,7 @@ const RULES: Rule[] = [
   { extension: ".ckpt", reason: "Model weights — large, and usually downloadable", recommended: false },
   { extension: ".pt", reason: "Model weights — large, and usually downloadable", recommended: false },
   { extension: ".pth", reason: "Model weights — large, and usually downloadable", recommended: false },
-  { extension: ".cbx", reason: "A CodeBox bundle of this project, inside the project", recommended: true },
+  { extension: ".cbx", reason: "A CBX bundle of this project, inside the project", recommended: true },
   { extension: ".pyc", reason: "Python bytecode", recommended: true },
   { extension: ".log", reason: "Log files", recommended: false },
 

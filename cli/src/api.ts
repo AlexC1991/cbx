@@ -368,7 +368,10 @@ export async function findProject(
     throw error;
   });
   const ownersMatch = (project: AccountProject) =>
-    project.slug.toLowerCase() === bare || project.name.toLowerCase() === bare;
+    project.slug.toLowerCase() === bare ||
+    project.name.toLowerCase() === bare ||
+    /* By id too: a run is handed its project's id as CODEROOK_PROJECT. */
+    project.id.toLowerCase() === trimmed.toLowerCase();
 
   if (!owner) {
     const mine = all.find(ownersMatch);
@@ -527,9 +530,11 @@ export async function cancelMerge(mergeTrackId: string): Promise<void> {
   await call(`/v1/merge-tracks/${mergeTrackId}/cancel`, { method: "POST" });
 }
 
-/** The four answers a project gives about machines. */
+/** The answers a project gives about machines. */
 export type AiAccess = {
   aiRead: boolean;
+  /** May what is read be used to train a model. Off unless the owner turned it on. */
+  aiTrain: boolean;
   aiDownload: boolean;
   aiContribute: boolean;
   aiRequest: boolean;
@@ -560,34 +565,25 @@ export async function aiAccess(repositoryId: string): Promise<AiAccess> {
   const allowed = (key: string) => ai[key] !== false;
   return {
     aiRead: allowed("read"),
+    /* The one answer that starts as no: a service that does not send it has not been asked. */
+    aiTrain: ai.train === true,
     aiDownload: allowed("download"),
     aiContribute: allowed("contribute"),
     aiRequest: allowed("request"),
   };
 }
 
-/**
- * Change one answer.
- *
- * One at a time, matching the site: each is a separate decision, and sending
- * all four would make turning off downloads look like it needed a view about
- * indexing as well.
- */
-export async function setAiAccess(
-  repositoryId: string,
-  change: Partial<AiAccess>,
-): Promise<void> {
-  await call(`/v1/repositories/${encodeURIComponent(repositoryId)}`, {
-    method: "PATCH",
-    body: change,
-  });
-}
+/*
+  There is no setter for these. What AI may do with a project is changed by a
+  person on the website or in the desktop app; the service refuses it from
+  any token (ai_access_person_only), and this tool only ever holds one.
+*/
 
 /**
  * Change what a project says about itself.
  *
- * The same PATCH the AI switches use, which is where these live: a handful of
- * columns on the repository rather than a resource of their own.
+ * A PATCH on the repository, which is where these live: a handful of columns
+ * rather than a resource of their own.
  */
 export async function updateProject(
   repositoryId: string,
@@ -906,18 +902,38 @@ export async function markRelease(
   versionId: string,
   name: string,
   notes?: string | null,
+  options: { prerelease?: boolean; channel?: string } = {},
 ): Promise<{ name: string; versionId: string }> {
   const body = await call<{ release?: { name?: string; versionId?: string } }>(
     `/v1/repositories/${encodeURIComponent(repositoryId)}` +
       `/versions/${encodeURIComponent(versionId)}/release`,
     // `call` serialises the body itself; handing it a string would send a
     // JSON-encoded string where the service expects an object.
-    { method: "PUT", body: { name, ...(notes ? { notes } : {}) } },
+    { method: "PUT", body: { name, ...(notes ? { notes } : {}), ...options } },
   );
   return {
     name: String(body.release?.name ?? name),
     versionId: String(body.release?.versionId ?? versionId),
   };
+}
+
+/**
+ * Make a release's downloads public, or private again, apart from its source.
+ *
+ * What is attached to the release, its notes and the update feed are offered
+ * to anybody while the version's files keep their own visibility, so one
+ * project can ship its installers without a second public project for them.
+ */
+export async function setReleaseDownloadsPublic(
+  repositoryId: string,
+  versionId: string,
+  value: boolean,
+): Promise<void> {
+  await call(
+    `/v1/repositories/${encodeURIComponent(repositoryId)}` +
+      `/versions/${encodeURIComponent(versionId)}/release/downloads`,
+    { method: "PUT", body: { public: value } },
+  );
 }
 
 export type Issue = {
@@ -1000,6 +1016,12 @@ export async function releases(repositoryId: string): Promise<
     releasedAt: string;
     releasedBy: string;
     assets: unknown[];
+    /** What `cbx attach` or the website put on it, apart from what runs shipped. */
+    attachments: unknown[];
+    /** Strangers can take what is attached (always so when the source is public). */
+    downloadsPublic: boolean;
+    /** The version's files are public too. */
+    sourcePublic: boolean;
   }>
 > {
   const body = await call<{ releases?: Array<Record<string, unknown>> }>(
@@ -1013,12 +1035,15 @@ export async function releases(repositoryId: string): Promise<
     releasedAt: String(row.releasedAt ?? ""),
     releasedBy: String(row.releasedBy ?? ""),
     assets: Array.isArray(row.assets) ? row.assets : [],
+    attachments: Array.isArray(row.attachments) ? row.attachments : [],
+    downloadsPublic: row.downloadsPublic === true,
+    sourcePublic: row.sourcePublic === true,
   }));
 }
 
 export async function collaborators(repositoryId: string): Promise<{
-  collaborators: Array<{ displayName: string; email: string; role: string }>;
-  invites: Array<{ email: string; role: string; expiresAt: string }>;
+  collaborators: Array<{ userId: string; displayName: string; email: string; role: string }>;
+  invites: Array<{ id: string; email: string; role: string; expiresAt: string }>;
 }> {
   const body = await call<{
     collaborators?: Array<Record<string, unknown>>;
@@ -1026,11 +1051,13 @@ export async function collaborators(repositoryId: string): Promise<{
   }>(`/v1/repositories/${encodeURIComponent(repositoryId)}/collaborators`);
   return {
     collaborators: (body.collaborators ?? []).map((row) => ({
+      userId: String(row.userId ?? ""),
       displayName: String(row.displayName ?? ""),
       email: String(row.email ?? ""),
       role: String(row.role ?? "member"),
     })),
     invites: (body.invites ?? []).map((row) => ({
+      id: String(row.id ?? ""),
       email: String(row.email ?? ""),
       role: String(row.role ?? "member"),
       expiresAt: String(row.expiresAt ?? row.expires_at ?? ""),
@@ -1041,10 +1068,55 @@ export async function collaborators(repositoryId: string): Promise<{
 export async function invite(
   repositoryId: string,
   input: { email: string; role: string },
+): Promise<{ inviteUrl?: string }> {
+  const row = await call<{ inviteUrl?: unknown }>(
+    `/v1/repositories/${encodeURIComponent(repositoryId)}/invites`,
+    { method: "POST", body: input },
+  );
+  return typeof row?.inviteUrl === "string" ? { inviteUrl: row.inviteUrl } : {};
+}
+
+/** Give one of the project's people another role. Admins only. */
+export async function setCollaboratorRole(
+  repositoryId: string,
+  userId: string,
+  role: string,
 ): Promise<void> {
-  await call(`/v1/repositories/${encodeURIComponent(repositoryId)}/invites`, {
+  await call(
+    `/v1/repositories/${encodeURIComponent(repositoryId)}/collaborators/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: { role } },
+  );
+}
+
+/** Take somebody off the project. Admins only. */
+export async function removeCollaborator(
+  repositoryId: string,
+  userId: string,
+): Promise<void> {
+  await call(
+    `/v1/repositories/${encodeURIComponent(repositoryId)}/collaborators/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Withdraw an invite nobody has accepted yet. */
+export async function revokeInvite(
+  repositoryId: string,
+  inviteId: string,
+): Promise<void> {
+  await call(
+    `/v1/repositories/${encodeURIComponent(repositoryId)}/invites/${encodeURIComponent(inviteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Join a project from an invite link (or the token inside it). */
+export async function acceptInvite(
+  token: string,
+): Promise<{ repositoryId: string; role: string }> {
+  return call<{ repositoryId: string; role: string }>("/v1/invites/accept", {
     method: "POST",
-    body: input,
+    body: { token },
   });
 }
 
@@ -1182,6 +1254,22 @@ export async function runs(
   });
 }
 
+/** Stop a run that is waiting or working. */
+/** Start a finished run again: same action, same save, same pull request. */
+export async function rerunRun(
+  repositoryId: string,
+  runId: string,
+): Promise<{ id: string; number: number }> {
+  return call<{ id: string; number: number }>(
+    `/v1/repositories/${encodeURIComponent(repositoryId)}/runs/${encodeURIComponent(runId)}/rerun`,
+    { method: "POST" },
+  );
+}
+
+export async function cancelRun(repositoryId: string, runId: string): Promise<void> {
+  await call(`/v1/repositories/${encodeURIComponent(repositoryId)}/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+}
+
 /** Everything a run printed, in the order it printed it. */
 export async function runLogs(
   repositoryId: string,
@@ -1209,6 +1297,57 @@ export async function tokens(): Promise<
     lastUsedAt: String(row.lastUsedAt ?? ""),
     createdAt: String(row.createdAt ?? ""),
   }));
+}
+
+/** The project's private paths: patterns only its own people see (members only). */
+export async function getPrivatePaths(repositoryId: string): Promise<string[]> {
+  const body = await call<{ patterns: string[] }>(`/v1/repositories/${encodeURIComponent(repositoryId)}/private-paths`);
+  return body.patterns ?? [];
+}
+
+/** Replace them. The project's owner or an admin only. */
+export async function putPrivatePaths(repositoryId: string, patterns: string[]): Promise<string[]> {
+  const body = await call<{ patterns: string[] }>(`/v1/repositories/${encodeURIComponent(repositoryId)}/private-paths`, {
+    method: "PUT",
+    body: { patterns },
+  });
+  return body.patterns ?? [];
+}
+
+/** A signed-in request to any route, for commands with many of them (pr_command.ts). */
+export async function callApi<T>(route: string, options: { method?: string; body?: unknown } = {}): Promise<T> {
+  return call<T>(route, options);
+}
+
+/** A GET whose answer is bytes, not JSON (a draft's raw file). Errors still arrive as JSON. */
+export async function callApiBytes(route: string): Promise<Uint8Array> {
+  const token = await loadToken();
+  if (!token) throw new Error("Not signed in. Run: cbx sign-in");
+  const response = await fetch(`${apiOrigin()}${route}`, {
+    headers: {
+      accept: "application/octet-stream, application/json",
+      authorization: `Bearer ${token}`,
+      "user-agent": "CodeRook-CLI/0.1",
+      ...clientHeaders(),
+    },
+    signal: AbortSignal.timeout(REQUEST_DEADLINE_MS),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    let body: { error?: { message?: string; code?: string } } = {};
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      /* not JSON */
+    }
+    if (response.status === 401) throw new Error("That token was not accepted. Run: cbx sign-in");
+    throw new ServiceError(
+      body.error?.message ?? `${route} failed (${response.status})`,
+      response.status,
+      typeof body.error?.code === "string" ? body.error.code : null,
+    );
+  }
+  return new Uint8Array(await response.arrayBuffer());
 }
 
 export async function revokeToken(tokenId: string): Promise<void> {
@@ -1416,6 +1555,66 @@ export async function removeWebhook(
     `/v1/repositories/${encodeURIComponent(repositoryId)}/webhooks/${encodeURIComponent(webhookId)}`,
     { method: "DELETE" },
   );
+}
+
+/** One attempt to tell a webhook something (backend webhooks.ts). */
+export type WebhookDelivery = {
+  id: string;
+  event: string;
+  state: "pending" | "delivered" | "failed" | "abandoned";
+  attempts: number;
+  status: number | null;
+  detail: string | null;
+  createdAt: string;
+  deliveredAt: string | null;
+};
+
+const webhookRoute = (repositoryId: string, webhookId: string) =>
+  `/v1/repositories/${encodeURIComponent(repositoryId)}/webhooks/${encodeURIComponent(webhookId)}`;
+
+/** Which events a webhook gets (empty is every one), or switch it back on. */
+export async function updateWebhook(
+  repositoryId: string,
+  webhookId: string,
+  change: { events?: string[]; active?: true },
+): Promise<void> {
+  await call(webhookRoute(repositoryId, webhookId), { method: "PATCH", body: change });
+}
+
+/** The twenty most recent, newest first. */
+export async function webhookDeliveries(
+  repositoryId: string,
+  webhookId: string,
+): Promise<WebhookDelivery[]> {
+  const body = await call<{ deliveries?: WebhookDelivery[] }>(
+    `${webhookRoute(repositoryId, webhookId)}/deliveries`,
+  );
+  return body.deliveries ?? [];
+}
+
+/** Send a signed "ping" now and say how the receiver answered. */
+export async function testWebhook(
+  repositoryId: string,
+  webhookId: string,
+): Promise<WebhookDelivery> {
+  const body = await call<{ delivery: WebhookDelivery }>(
+    `${webhookRoute(repositoryId, webhookId)}/test`,
+    { method: "POST" },
+  );
+  return body.delivery;
+}
+
+/** Send an earlier delivery's event again, as a new delivery. */
+export async function redeliverWebhook(
+  repositoryId: string,
+  webhookId: string,
+  deliveryId: string,
+): Promise<WebhookDelivery> {
+  const body = await call<{ delivery: WebhookDelivery }>(
+    `${webhookRoute(repositoryId, webhookId)}/deliveries/${encodeURIComponent(deliveryId)}/redeliver`,
+    { method: "POST" },
+  );
+  return body.delivery;
 }
 
 /**

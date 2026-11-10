@@ -11,28 +11,60 @@
  * command added without a summary is a type error rather than an omission.
  */
 
+/*
+  Grouped by what somebody is trying to do, not by how the command works.
+  The old groups ("Your projects", "Other") had grown into one long list that
+  had to be read rather than scanned.
+*/
 export type CommandGroup =
   | "Getting started"
-  | "Working with a folder"
+  | "Saving work"
   | "History on this machine"
-  | "Your projects"
-  | "People"
-  | "When somebody saved first"
-  | "Bundles"
-  | "Actions"
-  | "Other";
+  | "Lines, merges and pull requests"
+  | "Versions and releases"
+  | "Project settings"
+  | "Issues"
+  | "Actions and builds"
+  | "Workspaces"
+  | "Mods and bundles"
+  | "For assistants";
 
 /** The order groups appear in help, which is the order somebody meets them. */
 export const GROUP_ORDER: CommandGroup[] = [
   "Getting started",
-  "Working with a folder",
+  "Saving work",
   "History on this machine",
-  "Your projects",
-  "People",
-  "When somebody saved first",
-  "Bundles",
-  "Actions",
-  "Other",
+  "Lines, merges and pull requests",
+  "Versions and releases",
+  "Project settings",
+  "Issues",
+  "Actions and builds",
+  "Workspaces",
+  "Mods and bundles",
+  "For assistants",
+];
+
+/**
+ * The order commands appear inside their group in `cbx help`.
+ *
+ * Kept apart from where the commands are declared, which follows the history
+ * of the file rather than what somebody looks for first. A command missing
+ * from this list still appears, after the ones that are in it.
+ */
+export const LISTING_ORDER: string[] = [
+  "sign-in", "whoami", "sign-out", "doctor", "update", "projects", "clone", "link", "unlink", "import", "transfer",
+  "status", "submit", "diff", "get", "track", "ignore", "licence",
+  "init", "save", "log", "restore", "switch", "push", "pull",
+  "tracks", "line-rules", "merges", "merge", "propose", "proposals", "pr",
+  "versions", "mark", "notes", "labels", "promote", "release", "releases", "attach", "held", "review", "undo",
+  "take-down", "verify", "deps",
+  "about", "features", "visibility", "ai", "private", "upload-rules", "people", "watch", "hooks", "secret", "assistant",
+  "security", "pages", "fork", "hand-over", "delete",
+  "issues", "issue",
+  "actions", "runs", "logs", "cancel", "rerun", "approve", "runner", "build", "machines",
+  "workspace",
+  "mods", "bundle", "unbundle", "inspect",
+  "mcp", "skill", "tokens",
 ];
 
 export type CommandOption = {
@@ -50,6 +82,11 @@ export type CommandSpec = {
   summary: string;
   /** How it is typed, without the leading "coderook". */
   usage: string;
+  /**
+   * A shorter usage for the command list, when the full one would not fit a
+   * line. `cbx help <command>` always shows the full usage.
+   */
+  brief?: string;
   /** The longer explanation, shown by `cbx help <command>`. */
   detail?: string;
   options?: CommandOption[];

@@ -1,5 +1,5 @@
 /**
- * The CodeBox `.cbx` bundle, as `prototype/cbx_benchmark.py` writes it.
+ * The CBX `.cbx` bundle, as `prototype/cbx_benchmark.py` writes it.
  *
  * This is a port of that format, not a second one. The byte layout, the
  * manifest keys, the codec rule and the chunk index are taken from the
@@ -395,12 +395,12 @@ export async function readManifest(source: string): Promise<Manifest> {
   try {
     const size = (await handle.stat()).size;
     if (size < HEADER_BYTES + FOOTER_BYTES) {
-      throw new Error("That file is too small to be a CodeBox bundle");
+      throw new Error("That file is too small to be a CBX bundle");
     }
     const header = Buffer.alloc(HEADER_BYTES);
     await handle.read(header, 0, HEADER_BYTES, 0);
     if (header.subarray(0, 4).toString("latin1") !== HEADER_MAGIC) {
-      throw new Error("That file is not a CodeBox bundle");
+      throw new Error("That file is not a CBX bundle");
     }
     const version = header.readUInt16LE(4);
     if (!SUPPORTED_FORMAT_VERSIONS.has(version)) {

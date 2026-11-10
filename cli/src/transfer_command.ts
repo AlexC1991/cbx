@@ -44,12 +44,8 @@ import process from "node:process";
 import { createIssue, findProject, updateProject } from "./api.js";
 import { readForgeUrl, type Forge } from "./forge_url.js";
 import type { Parsed } from "./registry.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
 
 /** A read token from the environment, or nothing. Never a flag. */
 function forgeToken(forge: Forge): string | null {

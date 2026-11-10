@@ -22,6 +22,8 @@ test("run obtains an exact compaction quote before sending any object body", asy
   const originalFetch = globalThis.fetch;
   const events: Array<{ path: string; method: string; quote: string | null }> = [];
   let quotedStoredSize = 0;
+  const publishBodies: string[] = [];
+  const progress: import("../src/shared/types.ts").UploadProgress[] = [];
   try {
     await writeFile(path.join(folder, "large.txt"), "repeatable text\n".repeat(2_000));
     globalThis.fetch = async (input, init = {}) => {
@@ -99,6 +101,11 @@ test("run obtains an exact compaction quote before sending any object body", asy
         return json({ objectId, size: 32_000, storedSize: quotedStoredSize }, 201);
       }
       if (url.pathname.endsWith("/versions") && method === "POST") {
+        publishBodies.push(String(init.body));
+        await new Promise((resolve) => setTimeout(resolve, 1150));
+        assert.ok(progress.filter((event) => event.completion?.phase === "confirming").length >= 2);
+        assert.ok(progress.every((event) => event.stage !== "done"), "no success before server confirmation");
+        if (publishBodies.length === 1) return json({ error: { code: "temporarily_unavailable", message: "Try again" } }, 503);
         return json({
           version: { id: crypto.randomUUID(), sequence: 1 },
           manifest: {
@@ -122,8 +129,13 @@ test("run obtains an exact compaction quote before sending any object body", asy
         repositoryId: null,
         baseVersionId: null,
       },
-      () => undefined,
+      (event) => progress.push(event),
     );
+    assert.equal(progress.at(-1)?.stage, "done");
+    assert.ok(progress.some((event) => event.completion?.phase === "local"));
+    assert.ok(progress.some((event) => event.completion?.phase === "retrying"));
+    assert.equal(publishBodies.length, 2);
+    assert.equal(publishBodies[0], publishBodies[1], "retry preserves the idempotency key and saved contents");
 
     const preflightAt = events.findIndex((event) =>
       event.path.endsWith("/uploads/preflight"),

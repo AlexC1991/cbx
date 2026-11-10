@@ -9,6 +9,7 @@
  */
 import path from "node:path";
 import process from "node:process";
+import { UploadDisplay } from "./upload_progress.js";
 
 import {
   cancelMerge,
@@ -22,10 +23,8 @@ import {
   pathFilter,
   restore,
   save,
-  status,
   switchLine,
   UnsavedChanges,
-  type Changes,
 } from "../../cbx/src/local/history.js";
 import { readMergeState } from "../../cbx/src/local/merge.js";
 import { Repository, type Save } from "../../cbx/src/local/repository.js";
@@ -45,17 +44,7 @@ import { resolveProject } from "./project_commands.js";
 import { classifyPublishFailure } from "./publish.js";
 import type { Parsed } from "./registry.js";
 
-const ESC = String.fromCharCode(27);
-const paint = (code: string) => (value: string) => `${ESC}[${code}m${value}${ESC}[0m`;
-const dim = paint("2");
-const bold = paint("1");
-const red = paint("31");
-const green = paint("32");
-const accent = paint("33");
-
-const short = (id: string) => id.slice(0, 10);
-const plural = (count: number, one: string, many = `${one}s`) =>
-  `${count.toLocaleString()} ${count === 1 ? one : many}`;
+import { accent, bold, dim, green, plural, printChanges, printLocalStatus, red, short } from "./local_status.js";
 
 function text(parsed: Parsed, ...names: string[]): string | undefined {
   for (const name of names) {
@@ -92,16 +81,6 @@ export function localFirst(
     const repository = await localHistory(from(parsed));
     return repository ? local(parsed, repository) : otherwise(parsed);
   };
-}
-
-function printChanges(changes: Changes, limit = 50): void {
-  const rows: Array<[string, string]> = [
-    ...changes.added.map((file): [string, string] => [green("added   "), file]),
-    ...changes.modified.map((file): [string, string] => [accent("changed "), file]),
-    ...changes.deleted.map((file): [string, string] => [red("deleted "), file]),
-  ].sort((left, right) => (left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0));
-  for (const [mark, file] of rows.slice(0, limit)) console.log(`  ${mark}${file}`);
-  if (rows.length > limit) console.log(dim(`  … and ${rows.length - limit} more`));
 }
 
 function describeSave(one: Save): string {
@@ -222,41 +201,7 @@ export async function commandSave(parsed: Parsed): Promise<number> {
 /* ---- status ---------------------------------------------------------- */
 
 export async function localStatus(_parsed: Parsed, repository: Repository): Promise<number> {
-  return reporting(async () => {
-    const now = await status(repository);
-    console.log(
-      `${bold(path.basename(repository.root))} on ${accent(now.line)}` +
-        (now.head ? dim(`  last saved ${short(now.head.id)}: ${now.head.message.split("\n")[0]}`) : dim("  nothing saved yet")),
-    );
-    if (now.merging) {
-      const left = now.merging.unresolved.length;
-      console.log(
-        `Merging ${accent(short(now.merging.theirs))}: ` +
-          (left ? red(`${plural(left, "file")} still ${left === 1 ? "has" : "have"} conflict markers`) : green("no conflict markers left")),
-      );
-      for (const conflict of now.merging.conflicts) {
-        const how =
-          conflict.kind === "text"
-            ? now.merging.unresolved.includes(conflict.path) ? "markers in it" : "edited"
-            : conflict.kind === "binary"
-              ? "both changed; this line's copy is in the folder"
-              : conflict.kind === "deleted-here"
-                ? "deleted here, changed there; their copy is in the folder"
-                : "changed here, deleted there; this copy is in the folder";
-        console.log(`  ${red("conflict")} ${conflict.path}  ${dim(how)}`);
-      }
-      console.log(dim(`Finish with cbx save, take a side with cbx merge --mine or --theirs, or cbx merge --cancel.`));
-    }
-    const count = changeCount(now.changes);
-    if (!count) {
-      console.log("Nothing has changed since the last save.");
-      return 0;
-    }
-    console.log(`${plural(count, "file")} changed since the last save:`);
-    printChanges(now.changes);
-    console.log(dim(`cbx diff shows the lines; cbx save -m "…" records them.`));
-    return 0;
-  });
+  return reporting(() => printLocalStatus(repository));
 }
 
 /* ---- log ------------------------------------------------------------- */
@@ -440,6 +385,7 @@ export async function localPush(parsed: Parsed, repository: Repository): Promise
       if (!chosen) return 1;
     }
     const interactive = process.stdout.isTTY;
+    const uploadDisplay = new UploadDisplay();
     const result = await push(repository, {
       credentials,
       projectName:
@@ -449,12 +395,14 @@ export async function localPush(parsed: Parsed, repository: Repository): Promise
       allowSecrets: has(parsed, "allow-secrets"),
       acknowledged: has(parsed, "yes", "y"),
       report: (event) => {
+        if (event.kind === "upload") uploadDisplay.report(event.progress);
         if (event.kind === "save" && interactive) {
           process.stdout.write(
             `\r${dim(`Sending ${event.index + 1} of ${event.total}: ${event.save.message.split("\n")[0]!.slice(0, 50)}`)}   `,
           );
         }
         if (event.kind === "pushed" || event.kind === "unchanged") {
+          uploadDisplay.done();
           if (interactive) process.stdout.write(`\r${" ".repeat(80)}\r`);
           console.log(
             `  ${accent(short(event.save.id))}  ` +
@@ -463,7 +411,7 @@ export async function localPush(parsed: Parsed, repository: Repository): Promise
           );
         }
       },
-    });
+    }).finally(() => uploadDisplay.done());
     if (!result.pushed.length) {
       console.log(`Everything on ${accent(result.line)} is already on CodeRook.`);
       return 0;

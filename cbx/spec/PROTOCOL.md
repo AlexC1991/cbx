@@ -112,6 +112,7 @@ Common codes:
 | `delta-transport`, `delta-transport-v2`, `delta-batch-v2` | A changed small file may be sent as a patch against its previous version (section 5.8). Optional. |
 | `microchunk-map-v1` | Chunk large files with the `fastcdc-v3-micro` profile (256 KiB / 1 MiB / 4 MiB) instead of the size-banded profiles |
 | `repository-telemetry-v1` | The version-create response includes timing figures. Clients may ignore them. |
+| `version-delta-v1` | A save may name only what changed, with `filesFrom` (section 5.10), and the reply says `combined: true` when a save was combined with other changes |
 
 - **When discovery fails**, a client MUST assume no features and `identity` encoding only.
 - **gzip** may be used only when `contentEncodings` lists it.
@@ -325,6 +326,10 @@ Two ways to send small files in one request.
   - A base that is not an ancestor of the line's head is refused with 409 `workspace_base_invalid`.
 - **`expectedHeadVersionId`:** used only as the base when `baseVersionId` is absent.
 - **`idempotencyKey`:** 8–120 characters. A key already used in this repository returns the earlier version with `repeated: true` instead of making a second.
+- **`filesFrom`** (only when `/health` lists `version-delta-v1`): `{"versionId":"…","removed":["path", …]}`. The save then names in `files` only the entries that are new or differ from that version, and in `removed` the paths that version holds and this one does not. Before any check below, the server builds the whole list: the named version's files, minus `removed`, minus every path in `files`, plus `files`. Every rule in this section then applies to that whole list, exactly as if it had been sent.
+  - `files` may be empty when the save only removes files.
+  - A `versionId` that is not a verified version of this repository, or whose content was taken down, is refused with 409 `files_from_unavailable`; send the whole list instead. A malformed `filesFrom` is refused with 400 `files_from_invalid`.
+  - A server without `version-delta-v1` ignores the field and would publish `files` alone as the whole version, so a client MUST NOT send it there.
 
 Paths must be writable on every operating system. The server refuses:
 
@@ -350,9 +355,10 @@ What the server checks, in order:
    - if not, the upload goes onto a new merge track, the line is left alone, and the reply carries `mergeTrack: {id, reference, conflicts: [{kind, path}]}`.
 7. **Protected lines** refuse a direct publish with 409 `track_protected`.
 
-**The reply** is 201 `{version, manifest, mergeTrack?, repeated?}`:
+**The reply** is 201 `{version, manifest, mergeTrack?, repeated?, combined?}`:
 
-- `manifest.files[]` lists each file's `path` and `sha256`. It is `null` for a repeated attempt; read the files with section 4.4 instead.
+- `manifest.files[]` may list each file's `path` and `sha256`. A server that stores its manifests as a tree returns only the envelope, and it is `null` for a repeated attempt; read the files with section 4.4 instead.
+- `combined: true` (servers with `version-delta-v1`) means the base was not the line's head and the save was merged cleanly with the changes in between, so the version holds files this client did not send. Without `combined`, `mergeTrack` or `repeated`, such a server published exactly the list the save described, and a client may keep that list as the new version's listing instead of reading it back.
 
 **What a replicating client must do.** A client that must end up with exactly the files it sent, as a CBX push must, has two duties:
 

@@ -860,6 +860,13 @@ export async function commandBuild(parsed: Parsed): Promise<number> {
   const host = thisHost();
   console.log(dim(`Checking what this ${host.os} ${host.arch} machine can build with…`));
   const tools = await detectTools(host);
+  /*
+    Docker only when asked for. Every target is reached natively, by
+    cross-compiling or through WSL where it can be; a container is the last
+    resort somebody chooses with --docker, never one picked for them because
+    Docker Desktop happened to be running.
+  */
+  if (!parsed.flags.has("docker")) tools.docker = false;
   const plan = planBuild(project, host, tools, targets);
 
   console.log(`${bold(project.name)} ${dim(`(${project.preset})`)}`);

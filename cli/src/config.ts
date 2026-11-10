@@ -27,7 +27,8 @@ import type { Credentials } from "../../cbx/src/core/credentials.js";
 export const DEFAULT_API = "https://api.coderook.com";
 
 export function apiOrigin(): string {
-  return (process.env.CODEROOK_API_URL || DEFAULT_API).replace(/\/+$/, "");
+  /* CODEROOK_API is what a run is handed (with CODEROOK_TOKEN), so cbx inside a run needs no setup. */
+  return (process.env.CODEROOK_API_URL || process.env.CODEROOK_API || DEFAULT_API).replace(/\/+$/, "");
 }
 
 /**

@@ -169,7 +169,7 @@ Once a folder has a history, `status`, `diff`, `log`, `switch`, `merge`,
 unsaved change. `--force` discards those changes. Files the history has never
 held are never touched.
 
-## Proposals
+## Proposals and pull requests
 
 A line gets back to main by being proposed. The proposal is checked and
 reviewed before it lands, and it follows the line: saving onto it afterwards
@@ -194,10 +194,55 @@ Tests whenever a line is proposed or saved onto, and its result is a required
 check. `--on-save` runs an action on every save, and `--by-hand` only when
 somebody starts it.
 
+Every proposal also has a `coderook/malware` check: what the line adds or
+changes is scanned before it can land, and a finding names the file and stops
+the proposal being applied.
+
 A **protected** line refuses saves made straight onto it — from `cbx submit`,
 the desktop application and `git push` alike — so the way in is a line of your
 own and a proposal. It also cannot be put back on an earlier save, and a merge
 cannot land on it over a conflict or a failing check.
+
+### Pull requests from the terminal
+
+```
+cbx pr list [--all] [--mine] [--label bug]   this project's pull requests
+cbx pr view M-3                    description, reviews, checks, conversation, what blocks it
+cbx pr files M-3                   what it changes
+cbx pr comment M-3 -m "…" [--line src/app.ts:42]
+cbx pr approve M-3                 or: cbx pr request-changes M-3 -m "…"
+cbx pr ask M-3 sam,priya           ask people to review it
+cbx pr label M-3 bug,ui
+cbx pr ready M-3                   or: draft, title, retarget, close, reopen
+cbx pr merge M-3
+```
+
+An approval stops counting when new saves land on the line, and a draft
+cannot be merged until it is marked ready. The website's Pull requests tab
+does the same, with comments on lines and suggested changes.
+
+## Keeping files private
+
+```
+cbx private add "design/" "*.psd"   a folder anywhere, a file type
+cbx private list
+cbx private remove "*.psd"
+```
+
+In a public project, everybody outside it is served every version without
+those files: the file list, zips, git clone, Pages and search leave them out.
+Members see everything. Only the owner or an admin can change the list.
+
+### Signed releases and dependencies
+
+```
+cbx release v2.0 --draft --generate-notes  nothing public until: cbx release publish --version 41
+cbx release v2.1.0-beta.1 --prerelease --channel beta
+cbx verify sam/editor v2.0.0 ./setup.exe   check a download against the signed manifest
+cbx deps                                   known vulnerabilities in the lockfiles (OSV)
+cbx pr merge M-3 --squash
+cbx pr auto-merge M-3
+```
 
 ## Who can reach a project
 
@@ -212,6 +257,26 @@ command refuses rather than waiting. Going private never asks.
 
 A public project's page offers only its named versions that have not been
 hidden (see `cbx promote` and `cbx mark --hide`).
+
+## Project settings
+
+Everything on the website's Settings screen has a command, and each one shows
+what is set when given nothing to change:
+
+```
+cbx about --name "Night Owl Diner" --description "…"   name and description
+cbx line-rules main --protect --approvals 1 --checks build,test --code-owners on
+cbx upload-rules --ignore .coderookignore --encrypt on --warn-large 512
+cbx assistant automated --review on --describe on      the pull-request assistant
+cbx hooks --test | --deliveries | --redeliver <id> | --on <id>
+cbx people --change sam@example.com --role admin       or --remove, --cancel-invite
+cbx security policy --on --text SECURITY.md
+cbx hand-over sam my-project                           offer it to another owner
+```
+
+The one exception is AI access. `cbx ai` shows what a project lets AI do;
+changing it is for a person, on the website (Settings → Access & AI) or in
+the desktop app. The service refuses the change from any token.
 
 ## Pages
 
@@ -435,6 +500,143 @@ Assets are separate and unaffected. They attach to a version from a run's
 artifacts or with `cbx attach <file>`, so a release made by pushing a tag
 simply has none until something adds them — which is what a release without a
 build has always looked like.
+
+## Actions
+
+```
+cbx runs                  what has run, and how it went
+cbx logs 12 --follow      watch a run as it happens
+cbx cancel 12             stop a run that is waiting or working
+cbx runner                run this project's work on this machine
+```
+
+CodeRook's own runners give every account 1,000 minutes a month; your own
+machine has no limit. A run nobody picks up within a day is ended with the
+reason.
+
+### More from Actions
+
+```
+cbx rerun 12                       run it again, against the same save
+cbx approve 14                     a run waiting for approval
+cbx actions check                  check .rook/workflows/*.yml before saving
+cbx actions set Nightly --schedule "0 3 * * *" --timeout 30
+cbx actions set Deploy --approval on --concurrency deploy --cancel-old
+cbx secret set DEPLOY_TOKEN        asked for at a hidden prompt; never shown again
+cbx secret list
+```
+
+Runs get `CODEROOK_API` and `CODEROOK_PROJECT`. A job allowed to act on the
+project also receives a temporary `CODEROOK_TOKEN`; credential-free workspace
+checks and artifact-producing builds receive no project write token.
+
+Project secrets require approval tied to the saved source and execution
+settings. PR checks receive none. Workspace release recipes request only their
+configured secret names. Credential-capable jobs cannot retain artifacts: build
+packages in a separate credential-free job, then publish the approved artifact.
+
+CLI 0.41.1 buffers complete output lines before masking, including tokens split
+across process chunks. It also isolates the child process's HOME/npm settings
+and stops inheriting unrelated host environment credentials. Supply required
+service credentials through the approved Action, not the runner's own login.
+Use a dedicated native runner: these protections do not sandbox project code
+against the host filesystem or stop a malicious approved command sending a key
+over the network. Review and approve the exact release code before adding keys.
+
+## Issues
+
+```
+cbx issue view 12
+cbx issue comment 12 -m "Fixed in v41"
+cbx issue close 12 --duplicate-of 9        or --reason not-planned
+cbx issue label 12 bug,ui                  --remove to take them off
+cbx issue assign 12 sam                    or none
+cbx issue labels --starter
+cbx issue labels add crash --colour d73a4a      or change, remove
+cbx issue rules add auto-label --words crash,freeze --label crash
+cbx issue rules off 2                      on, change, remove by number
+```
+
+## Forks and security reports
+
+```
+cbx fork sam/editor                        your own copy
+cbx fork offer fix-export --title "…"      offer a line back as a pull request
+cbx fork sync                              the original's latest, on "upstream"
+cbx security report sam/editor --title "…" --severity high
+cbx security list | view S-3 | reply S-3 -m "…" | mark S-3 fixed
+cbx security policy --on --text SECURITY.md
+```
+
+## Releases and app downloads
+
+```
+cbx release 1.4.0                        name the newest save as a release
+cbx attach ./dist/MyApp-Setup-1.4.0.exe  put the installer on it
+cbx release --downloads public           offer its downloads, keep the source private
+cbx releases                             each release, its files, and who can take them
+```
+
+In a public project, `--downloads public` offers a release's notes,
+attachments and update feed to anybody while the version's own files keep
+their visibility, so one project holds the code and ships the app. There is
+no need for a second project that only holds releases. `--downloads private`
+takes them back. Without a release name it changes an existing release and
+leaves its notes alone.
+
+Every attached file is scanned for malware before anybody outside the project
+can download it, usually within a minute; one that fails is never offered, and
+whoever attached it and the owner are told what was found.
+
+`cbx releases` marks each one `public`, `downloads public` or `private`, and
+for a public project prints the addresses an app or a script reads, which
+need no account:
+
+```
+https://api.coderook.com/v1/public/projects/OWNER/SLUG/releases/latest
+https://api.coderook.com/v1/public/projects/OWNER/SLUG/releases
+https://api.coderook.com/v1/public/projects/OWNER/SLUG/updates      electron-updater's generic provider
+```
+
+## Mod repositories for games
+
+A mod repository is where a game's players get mods from. The game's maker
+sets one up and its rules; modders publish with their own accounts; nothing is
+listed until it passes those rules and a malware scan.
+
+```
+cbx mods create my-game --name "My Game" --allow .png,.ogg,.json --nested .pak
+cbx mods builds my-game --new                 a build secret for the game, shown once
+cbx mods builds my-game --register secret.bin or your own, never printed
+cbx mods info my-game                         the address and public key to pin
+cbx mods settings my-game --uploads owner     change the rules
+```
+
+Rules: `--allow` and `--block` for file types (programs and scripts such as
+`.exe`, `.dll`, `.ps1` and `.js` are refused in every repository, and so is a
+file that is really a program whatever it is called), `--nested` for archive
+types that are opened and checked too, `--manifest` and `--fields` for the
+manifest each part carries (`mod.json` by default) and which of its fields must
+match, `--max-part`, `--max-files`, `--max-parts` and `--max-ratio` for size,
+and `--uploads anyone|owner`.
+
+```
+cbx mods publish ./BetterTrees --repo my-game              zip, upload, wait for the checks
+cbx mods publish ./HD-Art --repo my-game --part animals    one part of a bigger mod
+cbx mods list my-game                                      your mods and how their checks went
+cbx mods remove better-trees --repo my-game
+```
+
+`publish` reads the folder's manifest for the mod's id, name, folder and
+version (`--id`, `--name`, `--folder` and `--version` override it), writes the
+manifest the repository expects into the zip, uploads in pieces that are
+retried, and waits up to 30 minutes for the result; `--no-wait` returns
+straight away. A rejected part says what was wrong, file by file.
+
+The owner also has `cbx mods reports`, `cbx mods block <username> --take-down`,
+`cbx mods list --all`, `cbx mods remove --as-owner` and `cbx mods delete`.
+How the game signs its requests and checks the catalogue is at
+<https://coderook.com/docs#mod-repositories>.
 
 ## Building for every platform
 

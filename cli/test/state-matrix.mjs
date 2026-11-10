@@ -16,7 +16,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 
-import { assertSafeTarget, autoClean, scratchRoot, versionFilePayload } from "./live.mjs";
+import { apiOrigin, assertSafeTarget, autoClean, liveToken, scratchRoot, versionFilePayload } from "./live.mjs";
 import { linkIn } from "./links.mjs";
 
 assertSafeTarget();
@@ -32,16 +32,28 @@ const sweep = autoClean(
   (slug) => slug.startsWith("mx-") && slug.endsWith(`-${RUN}`),
   root,
 );
-const API = "https://api.coderook.com";
-const token = readFileSync(
-  path.join(process.env.APPDATA, "CodeRook", "token"), "utf8").trim();
+/* The service the run is pointed at (CODEROOK_API_URL), not production by default of this file. */
+const API = apiOrigin();
+/* The token the run is handed (CODEROOK_TOKEN) first, like every other suite. */
+const token = liveToken();
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 const entry = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");
 
-const api = async (route, method = "GET", body) => {
-  const response = await fetch(`${API}${route}`, {
-    method, headers, ...(body ? { body: JSON.stringify(body) } : {}),
-  });
+const api = async (route, method = "GET", body, retried = false) => {
+  let response;
+  try {
+    response = await fetch(`${API}${route}`, {
+      method, headers, ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+  } catch (error) {
+    /*
+      The commands between calls block this process for seconds, and a server
+      on this machine (the test bench) closes the idle connection meanwhile;
+      the next call then finds it reset. Once more on a fresh connection.
+    */
+    if (retried) throw error;
+    return api(route, method, body, true);
+  }
   return { status: response.status, body: await response.json().catch(() => null) };
 };
 
@@ -92,7 +104,8 @@ function headHolds(homeM, slug) {
   const into = path.join(root, `mx-see-${Math.random().toString(36).slice(2, 8)}`);
   rook(root, homeM, ["clone", slug, into]);
   return Object.fromEntries(
-    readdirSync(into).sort().map((name) => [
+    /* .coderook is the folder's own copy of its link (config.ts), not project content. */
+    readdirSync(into).filter((name) => name !== ".coderook").sort().map((name) => [
       name, readFileSync(path.join(into, name), "utf8").trim(),
     ]),
   );

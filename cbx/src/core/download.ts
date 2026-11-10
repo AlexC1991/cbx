@@ -34,6 +34,25 @@ async function exists(target: string): Promise<boolean> {
   }
 }
 
+/** How many bytes are at `target`, or nothing when there is no file. */
+async function sizeOnDisk(target: string): Promise<number> {
+  try {
+    return (await stat(target)).size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * A running hash of what is already at `target`, to carry on from. Streamed,
+ * so resuming a large file does not first hold all of it.
+ */
+async function digestPrefix(target: string) {
+  const hash = createHash("sha256");
+  for await (const block of createReadStream(target)) hash.update(block as Buffer);
+  return hash;
+}
+
 /** The digest of what is on disk, or null when nothing is there to read. */
 async function digestOf(target: string): Promise<string | null> {
   try {
@@ -167,6 +186,100 @@ export class DownloadCancelled extends Error {
   }
 }
 
+/**
+ * One transfer that could not be completed, named, with the reason in words.
+ *
+ * What people saw instead was the single word `terminated` — undici's message
+ * for a body the other end stopped sending — with no file, no cause and no
+ * hint that anything had been tried. Eight clones started seconds after the
+ * API was redeployed lost their connections mid-file, and four of them ended
+ * on exactly that. The status and code travel with it, because callers ask
+ * whether a failure was a refusal or the network.
+ */
+export class DownloadFailed extends Error {
+  readonly status?: number;
+  readonly code?: string;
+
+  constructor(
+    readonly what: string,
+    readonly reason: string,
+    readonly attempts: number,
+    cause: unknown,
+  ) {
+    super(
+      `Could not download ${what}: ${reason}` +
+        (attempts > 1 ? ` (tried ${attempts} times).` : "."),
+      { cause },
+    );
+    this.status = (cause as { status?: number }).status;
+    this.code = (cause as { code?: string }).code;
+  }
+}
+
+/** What each network failure means, for somebody who has not met the code. */
+const PLAIN: Record<string, string> = {
+  ENOTFOUND: "CodeRook's address could not be looked up, so this computer may be offline",
+  EAI_AGAIN: "CodeRook's address could not be looked up, so this computer may be offline",
+  ECONNREFUSED: "the connection was refused",
+  ECONNRESET: "the connection was dropped",
+  EPIPE: "the connection was dropped",
+  ETIMEDOUT: "the connection timed out",
+  ENETUNREACH: "there is no route to the internet from here",
+  EHOSTUNREACH: "there is no route to the internet from here",
+  UND_ERR_CONNECT_TIMEOUT: "the connection timed out",
+  UND_ERR_SOCKET: "the connection closed before it finished arriving",
+  UND_ERR_RES_CONTENT_LENGTH_MISMATCH: "the connection closed before it finished arriving",
+};
+
+/**
+ * Why one request failed, said so that a person can act on it.
+ *
+ * Node keeps the real reason in `cause`, and for a failed happy-eyeballs
+ * connection in `cause.errors`; the top-level message is `fetch failed` or
+ * `terminated` whatever happened. The code goes in brackets after the words,
+ * for whoever needs to tell a dead network from a server that hung up.
+ */
+export function plainReason(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const status = (error as { status?: number }).status;
+  if (typeof status === "number") {
+    /* The fallback message is only the route; the service's own words are better. */
+    return error.message.startsWith("/v1/")
+      ? `CodeRook answered ${status}`
+      : `CodeRook answered ${status}: ${error.message}`;
+  }
+  if (error.name === "TimeoutError") {
+    return `it had not finished arriving after ${REQUEST_DEADLINE_MS / 60_000} minutes`;
+  }
+  type Cause = { code?: string; message?: string; errors?: Cause[] };
+  const cause = (error as { cause?: Cause }).cause;
+  const causes = cause?.errors?.length ? cause.errors : cause ? [cause] : [];
+  const codes = [...new Set(causes.map((one) => one.code).filter(Boolean))] as string[];
+  const said = codes.map((code) => PLAIN[code]).find(Boolean);
+  const detail = causes
+    .map((one) => [one.code, one.message].filter(Boolean).join(": "))
+    .filter(Boolean)[0];
+  if (error.message === "terminated") {
+    return (
+      `${said ?? "the connection closed before it finished arriving"}` +
+      (detail ? ` (${detail})` : "")
+    );
+  }
+  if (error.message === "fetch failed") {
+    return (
+      `CodeRook could not be reached${said ? `: ${said}` : ""}` +
+      (detail ? ` (${detail})` : "")
+    );
+  }
+  return error.message;
+}
+
+/** Where `content-range` says a partial answer starts, or null. */
+function rangeStart(headers: Headers): number | null {
+  const match = /^bytes (\d+)-\d+\/(?:\d+|\*)$/.exec(headers.get("content-range") ?? "");
+  return match ? Number(match[1]) : null;
+}
+
 export class Downloader {
   private aborted = false;
   private readonly controller = new AbortController();
@@ -183,31 +296,84 @@ export class Downloader {
   }
 
   /**
-   * One request, repeated while repeating it might help.
+   * Do `work` until it succeeds, it fails in a way repeating cannot help, or
+   * the attempts run out.
    *
    * A restore makes at least one request per file and, for a file kept in
    * pieces, one per piece — three thousand seven hundred and fifty-six for a
    * single file here. At those numbers a dropped connection is not a risk but
    * a certainty, and without this the whole restore ends on the first one.
+   *
+   * `work` is the whole transfer, body included. Retrying only until the
+   * headers arrived was the gap that ended clones: `fetch()` resolves on the
+   * headers, so a connection cut while the bytes were still coming — which is
+   * what a redeploy does to every connection it holds — escaped the loop and
+   * ended the whole run on one file.
+   *
+   * `progressed` lets a transfer that moved forward before failing start its
+   * count again, so a long file over a connection that keeps dropping is
+   * finished rather than abandoned; one that makes no progress still stops
+   * after `RETRY_ATTEMPTS`. `halt` stops it without retrying, for a run that
+   * has already failed elsewhere. `what` names the transfer in the error a
+   * person finally sees.
    */
-  private async request(route: string): Promise<Response> {
+  private async repeat<T>(
+    work: (attempt: number) => Promise<T>,
+    options: {
+      what?: string;
+      halt?: AbortSignal;
+      progressed?: () => Promise<boolean>;
+    } = {},
+  ): Promise<T> {
     let wait = RETRY_FIRST_WAIT_MS;
-    for (let attempt = 1; ; attempt += 1) {
+    let tries = 0;
+    for (let attempt = 1, stalled = 1; ; attempt += 1, stalled += 1) {
       this.check();
+      options.halt?.throwIfAborted();
+      tries = attempt;
       try {
-        return await this.attempt(route);
+        return await work(attempt);
       } catch (error) {
         // Its own cancellation first: `worthRetrying` knows nothing of it.
-        if (error instanceof DownloadCancelled) throw error;
-        if (attempt >= RETRY_ATTEMPTS || !worthRetrying(error)) throw error;
+        if (error instanceof DownloadCancelled || this.aborted) throw new DownloadCancelled();
+        if (options.halt?.aborted) throw options.halt.reason;
+        if (await options.progressed?.()) {
+          stalled = 0;
+          wait = RETRY_FIRST_WAIT_MS;
+        }
+        if (stalled >= RETRY_ATTEMPTS || !worthRetrying(error)) {
+          if (!options.what) throw error;
+          throw new DownloadFailed(options.what, plainReason(error), tries, error);
+        }
         try {
-          await pauseFor(this.controller.signal, wait);
+          await pauseFor(
+            options.halt
+              ? AbortSignal.any([this.controller.signal, options.halt])
+              : this.controller.signal,
+            wait,
+          );
         } catch {
-          throw new DownloadCancelled();
+          if (this.aborted) throw new DownloadCancelled();
+          throw options.halt?.reason ?? error;
         }
         wait *= 2;
       }
     }
+  }
+
+  /** A whole response body and its headers, under the retry rule. */
+  private async bytes(
+    route: string,
+    what: string,
+    halt?: AbortSignal,
+  ): Promise<{ body: Buffer; headers: Headers }> {
+    return this.repeat(
+      async () => {
+        const reply = await this.attempt(route, REQUEST_DEADLINE_MS, halt);
+        return { body: Buffer.from(await reply.arrayBuffer()), headers: reply.headers };
+      },
+      { what, halt },
+    );
   }
 
   private async attempt(
@@ -223,6 +389,9 @@ export class Downloader {
       failed, not one that is still working.
     */
     deadline = REQUEST_DEADLINE_MS,
+    /* The run's own stop, when a sibling transfer has already failed it. */
+    halt?: AbortSignal,
+    extra?: Record<string, string>,
   ): Promise<Response> {
     const token = await this.credentials.token();
     if (!token) throw new Error("Sign in again before downloading");
@@ -231,6 +400,7 @@ export class Downloader {
         authorization: `Bearer ${token}`,
         "user-agent": "CodeRook/0.1",
         ...clientHeaders(),
+        ...extra,
       },
       /*
         The download's own cancellation, and a deadline.
@@ -244,6 +414,7 @@ export class Downloader {
       signal: AbortSignal.any([
         this.controller.signal,
         AbortSignal.timeout(deadline),
+        ...(halt ? [halt] : []),
       ]),
     });
     if (!response.ok) {
@@ -254,9 +425,13 @@ export class Downloader {
       */
       const tooOld = readRefusal(response.status, text);
       if (tooOld) {
-        throw new Error(
-          `${tooOld.message} You are running ${tooOld.yourVersion ?? "an older build"}; ` +
-            `update from ${tooOld.upgradeUrl}.`,
+        /* With its status, so it is not retried as though it were the network. */
+        throw Object.assign(
+          new Error(
+            `${tooOld.message} You are running ${tooOld.yourVersion ?? "an older build"}; ` +
+              `update from ${tooOld.upgradeUrl}.`,
+          ),
+          { status: response.status },
         );
       }
       let message = `${route} failed (${response.status})`;
@@ -292,28 +467,29 @@ export class Downloader {
    * These routes are reads, so repeating the whole request is safe and is the
    * only way to replace a truncated body.
    */
-  private async json<T>(route: string): Promise<T> {
-    let wait = RETRY_FIRST_WAIT_MS;
-    for (let attempt = 1; ; attempt += 1) {
-      this.check();
-      try {
-        return await (await this.attempt(route)).json() as T;
-      } catch (error) {
-        if (error instanceof DownloadCancelled) throw error;
-        if (attempt >= RETRY_ATTEMPTS || !worthRetrying(error)) throw error;
-        try {
-          await pauseFor(this.controller.signal, wait);
-        } catch {
-          throw new DownloadCancelled();
-        }
-        wait *= 2;
-      }
+  private async json<T>(route: string, what: string): Promise<T> {
+    let tries = 0;
+    try {
+      return await this.repeat(async (attempt) => {
+        tries = attempt;
+        return (await (await this.attempt(route)).json()) as T;
+      });
+    } catch (error) {
+      /*
+        A refusal keeps its own words: "not found" is the answer, and callers
+        read its status. Only a failure that never reached an answer is
+        renamed, because that is the one that arrived as a bare `terminated`.
+      */
+      if (error instanceof DownloadCancelled) throw error;
+      if (typeof (error as { status?: number }).status === "number") throw error;
+      throw new DownloadFailed(what, plainReason(error), tries, error);
     }
   }
 
   async versions(repositoryId: string): Promise<RemoteVersion[]> {
     const body = await this.json<{ versions?: Array<Record<string, unknown>> }>(
       `/v1/repositories/${repositoryId}/versions`,
+      "the list of versions",
     );
     return (body.versions ?? []).map((row) => ({
       id: String(row.id ?? ""),
@@ -345,16 +521,26 @@ export class Downloader {
    * files to `git fast-import`, which wants them one after another anyway.
    */
   async archive(repositoryId: string, versionId: string): Promise<Uint8Array> {
-    const response = await this.attempt(
-      `/v1/repositories/${repositoryId}/versions/${versionId}/archive`,
-      ARCHIVE_DEADLINE_MS,
+    /*
+      Under the retry rule like everything else. It had none: one dropped
+      connection during an archive of hundreds of megabytes ended the import.
+    */
+    return this.repeat(
+      async () => {
+        const response = await this.attempt(
+          `/v1/repositories/${repositoryId}/versions/${versionId}/archive`,
+          ARCHIVE_DEADLINE_MS,
+        );
+        return new Uint8Array(await response.arrayBuffer());
+      },
+      { what: "the version's archive" },
     );
-    return new Uint8Array(await response.arrayBuffer());
   }
 
   async files(repositoryId: string, versionId: string): Promise<RemoteFile[]> {
     const body = await this.json<{ files?: Array<Record<string, unknown>> }>(
       `/v1/repositories/${repositoryId}/versions/${versionId}/files`,
+      "the version's list of files",
     );
     return (body.files ?? []).map((row) => {
       const pieces = Array.isArray(row.chunks) ? row.chunks : null;
@@ -480,10 +666,11 @@ export class Downloader {
         const packId = file.sealed ? undefined : file.pack?.objectId;
         if (packId && restoredPacks.has(packId)) continue;
         if (packId) {
-          const reply = await this.request(
+          const reply = await this.bytes(
             `/v1/repositories/${repositoryId}/objects/${packId}`,
+            packName(packed.get(packId) ?? []),
           );
-          const body = Buffer.from(await reply.arrayBuffer());
+          const body = reply.body;
           const packDigest = createHash("sha256").update(body).digest("hex");
           const expectedPackDigest = reply.headers.get("x-coderook-sha256");
           if (expectedPackDigest && packDigest !== expectedPackDigest) {
@@ -558,8 +745,11 @@ export class Downloader {
     try {
       for (const [packId, members] of packs) {
         this.check();
-        const reply = await this.request(`/v1/repositories/${repositoryId}/objects/${packId}`);
-        const body = Buffer.from(await reply.arrayBuffer());
+        const reply = await this.bytes(
+          `/v1/repositories/${repositoryId}/objects/${packId}`,
+          packName(members),
+        );
+        const body = reply.body;
         const expected = reply.headers.get("x-coderook-sha256");
         if (expected && createHash("sha256").update(body).digest("hex") !== expected) {
           throw new Error("A solid pack did not arrive intact");
@@ -606,8 +796,8 @@ export class Downloader {
     versionId: string,
     file: RemoteFile,
     target: string,
+    halt?: AbortSignal,
   ): Promise<string> {
-    const whole = createHash("sha256");
     /*
       A sealed file is read whole, by path, whatever shape it is stored in.
 
@@ -616,59 +806,67 @@ export class Downloader {
       that cannot match the digest this file was listed with.
     */
     const pieces = file.sealed ? [] : (file.chunks ?? []);
+    if (!pieces.length) {
+      const digest = await this.streamTo(
+        file.objectId && !file.sealed
+          ? `/v1/repositories/${repositoryId}/objects/${file.objectId}`
+          : `/v1/repositories/${repositoryId}/versions/${versionId}/file` +
+              `?path=${encodeURIComponent(file.path)}`,
+        file.path,
+        target,
+        halt,
+      );
+      if (file.sha256 && digest !== file.sha256) {
+        if (await recoverGzipFile(target, file.sha256)) {
+          this.recoveredFromGzip.push(file.path);
+          return file.sha256;
+        }
+      }
+      return digest;
+    }
+
+    const whole = createHash("sha256");
     let recovered = false;
-    // Captured so the generators below do not need `this` rebound.
-    const request = (route: string) => this.request(route);
+    // Captured so the generator below does not need `this` rebound.
+    const fetchPiece = (route: string, what: string) => this.bytes(route, what, halt);
     const check = () => this.check();
 
-    const source = pieces.length
-      ? (async function* () {
-          for (let at = 0; at < pieces.length; at += 1) {
-            check();
-            const piece = pieces[at]!;
-            const reply = await request(
-              `/v1/repositories/${repositoryId}/objects/${piece.objectId}`,
+    /*
+      Each piece is its own retried request, so a connection lost partway
+      through a large file costs the piece that was arriving and no more: the
+      ones already written stay written, and the file carries on from there.
+    */
+    const source = (async function* () {
+      for (let at = 0; at < pieces.length; at += 1) {
+        check();
+        const piece = pieces[at]!;
+        const reply = await fetchPiece(
+          `/v1/repositories/${repositoryId}/objects/${piece.objectId}`,
+          `${file.path} (piece ${at + 1} of ${pieces.length})`,
+        );
+        let body: Buffer = reply.body;
+        /*
+          Checked against what the upload recorded for this piece, before
+          a byte of it reaches the file. Without the digest the only
+          available check was the whole file's, which says that something
+          in seven gigabytes is wrong and nothing about what.
+        */
+        const digest = createHash("sha256").update(body).digest("hex");
+        if (piece.sha256 && digest !== piece.sha256) {
+          const plain = gunzippedMatching(body, piece.sha256);
+          if (!plain) {
+            throw new Error(
+              `${file.path}: piece ${at + 1} of ${pieces.length} ` +
+                `did not arrive intact`,
             );
-            let body: Buffer = Buffer.from(await reply.arrayBuffer());
-            /*
-              Checked against what the upload recorded for this piece, before
-              a byte of it reaches the file. Without the digest the only
-              available check was the whole file's, which says that something
-              in seven gigabytes is wrong and nothing about what.
-            */
-            const digest = createHash("sha256").update(body).digest("hex");
-            if (piece.sha256 && digest !== piece.sha256) {
-              const plain = gunzippedMatching(body, piece.sha256);
-              if (!plain) {
-                throw new Error(
-                  `${file.path}: piece ${at + 1} of ${pieces.length} ` +
-                    `did not arrive intact`,
-                );
-              }
-              recovered = true;
-              body = plain;
-            }
-            whole.update(body);
-            yield body;
           }
-        })()
-      : (async function* () {
-          const reply = await request(
-            file.objectId && !file.sealed
-              ? `/v1/repositories/${repositoryId}/objects/${file.objectId}`
-              : `/v1/repositories/${repositoryId}/versions/${versionId}/file` +
-                  `?path=${encodeURIComponent(file.path)}`,
-          );
-          if (!reply.body) return;
-          for await (const block of Readable.fromWeb(
-            reply.body as Parameters<typeof Readable.fromWeb>[0],
-          )) {
-            check();
-            const buffer = Buffer.from(block as Uint8Array);
-            whole.update(buffer);
-            yield buffer;
-          }
-        })();
+          recovered = true;
+          body = plain;
+        }
+        whole.update(body);
+        yield body;
+      }
+    })();
 
     /*
       `pipeline` rather than a write loop: it applies backpressure, and it
@@ -677,15 +875,104 @@ export class Downloader {
       up holding something that looks finished.
     */
     await pipeline(source, createWriteStream(target));
-    const digest = whole.digest("hex");
     if (recovered) this.recoveredFromGzip.push(file.path);
-    if (!pieces.length && file.sha256 && digest !== file.sha256) {
-      if (await recoverGzipFile(target, file.sha256)) {
-        this.recoveredFromGzip.push(file.path);
-        return file.sha256;
-      }
-    }
-    return digest;
+    return whole.digest("hex");
+  }
+
+  /**
+   * Stream one whole object to `target`, carrying on where a dropped
+   * connection left it, and answer with the digest of what was written.
+   *
+   * The body is part of the attempt. A connection cut halfway through used to
+   * escape the retry loop entirely, because `fetch()` had already resolved on
+   * the headers.
+   *
+   * Where the service said it serves byte ranges, a retry asks only for what
+   * is missing: what reached the disk is measured and hashed again from
+   * there, rather than trusted from a count that the failed stream may not
+   * have flushed. Anything other than a partial answer starting exactly at
+   * that byte is taken from the beginning, so a resumed file is never two
+   * different answers spliced together; the digest is checked by the caller
+   * either way.
+   */
+  private async streamTo(
+    route: string,
+    what: string,
+    target: string,
+    halt?: AbortSignal,
+  ): Promise<string> {
+    let resumable = false;
+    let before = 0;
+    let hash = createHash("sha256");
+    const check = () => this.check();
+    return this.repeat(
+      async (attempt) => {
+        let from = 0;
+        if (attempt > 1 && resumable) {
+          from = await sizeOnDisk(target);
+        }
+        let reply: Response;
+        try {
+          reply = await this.attempt(
+            route,
+            REQUEST_DEADLINE_MS,
+            halt,
+            from > 0 ? { range: `bytes=${from}-` } : undefined,
+          );
+        } catch (error) {
+          /*
+            Nothing left to send from there — the whole body had landed and
+            only its ending was lost. Taken again from the start rather than
+            guessed complete, because only the digest can say it is.
+          */
+          if (from === 0 || (error as { status?: number }).status !== 416) throw error;
+          from = 0;
+          reply = await this.attempt(route, REQUEST_DEADLINE_MS, halt);
+        }
+        before = from;
+        const append = from > 0 && reply.status === 206 && rangeStart(reply.headers) === from;
+        if (reply.status !== 206) {
+          resumable = reply.headers.get("accept-ranges") === "bytes";
+        }
+        hash = append ? await digestPrefix(target) : createHash("sha256");
+        const sink = createWriteStream(target, { flags: append ? "a" : "w" });
+        if (!reply.body) {
+          sink.end();
+          await new Promise<void>((resolve, reject) => {
+            sink.once("finish", resolve).once("error", reject);
+          });
+        } else {
+          await pipeline(
+            Readable.fromWeb(reply.body as Parameters<typeof Readable.fromWeb>[0]),
+            new Transform({
+              transform(block, _encoding, done) {
+                try {
+                  check();
+                } catch (error) {
+                  done(error as Error);
+                  return;
+                }
+                const buffer = Buffer.from(block as Uint8Array);
+                hash.update(buffer);
+                done(null, buffer);
+              },
+            }),
+            sink,
+          );
+        }
+        return hash.digest("hex");
+      },
+      {
+        what,
+        halt,
+        /*
+          Counted again from nothing when this attempt moved the file on —
+          judged by what reached the disk, since that is where the next
+          attempt starts.
+        */
+        progressed: async () => resumable && (await sizeOnDisk(target)) > before,
+      },
+    );
   }
 
   /**
@@ -723,6 +1010,15 @@ export class Downloader {
     const staging = `${destination}.incoming`;
     await rm(staging, { recursive: true, force: true });
     const manifest: Record<string, string> = {};
+    /*
+      Stops the other lanes once one transfer has failed for good.
+
+      Without it the first failure rejected the run while five other lanes
+      went on writing into the staging folder — so the cleanup below removed
+      it, and the lanes still running made it again. That is how failed clones
+      left `.incoming` folders behind.
+    */
+    const halt = new AbortController();
 
     try {
       let written = 0;
@@ -804,10 +1100,12 @@ export class Downloader {
           so fetch the decoded pack once, verify it, and materialise every
           member before releasing the buffer.
         */
-        const reply = await this.request(
+        const reply = await this.bytes(
           `/v1/repositories/${repositoryId}/objects/${packId}`,
+          packName(packed.get(packId) ?? []),
+          halt.signal,
         );
-        const body = Buffer.from(await reply.arrayBuffer());
+        const body = reply.body;
         const packDigest = createHash("sha256").update(body).digest("hex");
         const expectedPackDigest = reply.headers.get("x-coderook-sha256");
         if (expectedPackDigest && packDigest !== expectedPackDigest) {
@@ -838,7 +1136,7 @@ export class Downloader {
       const restoreFile = async (file: (typeof files)[number]): Promise<void> => {
         const full = inside(staging, file.path);
         await mkdir(path.dirname(full), { recursive: true });
-        const digest = await this.fetchInto(repositoryId, versionId, file, full);
+        const digest = await this.fetchInto(repositoryId, versionId, file, full, halt.signal);
         /*
           The whole file's digest, checked after every piece has already been
           checked individually. Both are needed: the pieces catch a corrupt or
@@ -903,28 +1201,46 @@ export class Downloader {
           });
         }
       };
+      /*
+        The first failure that outlasted its retries, which is what the run
+        reports. Whatever the other lanes throw while being stopped is only
+        the echo of it.
+      */
+      let failure: { error: unknown } | null = null;
       const lane = async (): Promise<void> => {
         for (;;) {
+          if (halt.signal.aborted) return;
           const at = next;
           next += 1;
           if (at >= jobs.length) return;
-          this.check();
           const job = jobs[at]!;
           const size = sizeOf(job);
           await roomFor(size);
+          if (halt.signal.aborted) return;
           flying += size;
           try {
+            this.check();
             if (job.kind === "pack") await restorePack(job.id);
             else await restoreFile(job.file);
+          } catch (error) {
+            if (!failure) failure = { error };
+            halt.abort(new Error("stopped: another file failed"));
+            return;
           } finally {
             flying -= size;
             wakeAll();
           }
         }
       };
+      /*
+        Every lane settled before anything else happens — on failure most of
+        all, so that nothing is still writing into the staging folder when it
+        is removed.
+      */
       await Promise.all(
         Array.from({ length: Math.min(LANES, jobs.length) }, () => lane()),
       );
+      if (failure) throw (failure as { error: unknown }).error;
 
       /*
         Everything has arrived and verified, so it can go into place. Each
@@ -1001,6 +1317,19 @@ export class Downloader {
       throw error;
     }
   }
+}
+
+/**
+ * A solid pack named by what is in it. Its object id means nothing to the
+ * person reading the error; the files they will be missing do.
+ */
+function packName(members: RemoteFile[]): string {
+  const first = members[0]?.path;
+  if (!first) return "a pack of small files";
+  const others = members.length - 1;
+  return others > 0
+    ? `${first} and ${others} other small file${others === 1 ? "" : "s"} stored with it`
+    : first;
 }
 
 /** The gunzipped bytes when they hash to `expected`, otherwise null. */

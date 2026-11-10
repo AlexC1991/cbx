@@ -27,7 +27,7 @@ import process from "node:process";
 import { Downloader } from "../../cbx/src/core/download.js";
 import { changedFiles, readRules } from "../../cbx/src/core/worktree.js";
 
-import { aiAccess, findProject, projects, versions } from "./api.js";
+import { aiAccess, callApi, findProject, projects, versions } from "./api.js";
 import { credentials, readLink } from "./config.js";
 
 /** What the protocol calls itself. Both clients accept this revision. */
@@ -123,6 +123,21 @@ async function withVersion(
 
 const TOOLS: Tool[] = [
   {
+    name: "coderook_usage",
+    description:
+      "Read the project's shared billing-account workspace credits (included, spent, reserved and purchased), separate PR assistant allowance and UTC monthly reset. Supply a project or use the linked folder. Hosted jobs reserve included then purchased credits; insufficient funds leave jobs queued. Native runners use no hosted credits. Workspace top-ups do not refill PR allowance. This tool cannot buy credits or enable recurring payments; purchases stay in CodeRook Subscription or repository Settings.",
+    inputSchema: {
+      type: "object",
+      properties: { project: { type: "string" } },
+      additionalProperties: false,
+    },
+    run: async (input) => {
+      const project = await resolve(input.project);
+      await assertMayRead(project.id, project.slug);
+      return JSON.stringify(await callApi(`/v1/repositories/${encodeURIComponent(project.id)}/workspace-usage`), null, 2);
+    },
+  },
+  {
     name: "coderook_projects",
     description:
       "Every project on the signed-in CodeRook account, with how much each " +
@@ -160,7 +175,7 @@ const TOOLS: Tool[] = [
       return saved
         .map(
           (one) =>
-            `v${one.sequence}  ${one.createdAt.slice(0, 10)}  ${one.fileCount} files  ` +
+            `v${one.sequence}  ${one.createdAt.slice(0, 10)}  ${one.fileCount} ${one.fileCount === 1 ? "file" : "files"}  ` +
             `${bytes(one.storedSize)}  ${one.message || "(no message)"}`,
         )
         .join("\n");
@@ -192,7 +207,7 @@ const TOOLS: Tool[] = [
       if (files.length > shown.length) {
         lines.push(`… and ${files.length - shown.length} more`);
       }
-      return `v${version.sequence} · ${files.length} files\n${lines.join("\n")}`;
+      return `v${version.sequence} · ${files.length} ${files.length === 1 ? "file" : "files"}\n${lines.join("\n")}`;
     },
   },
   {

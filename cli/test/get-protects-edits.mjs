@@ -12,14 +12,14 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
-import { assertSafeTarget, autoClean, liveToken, scratchRoot, versionFilePayload } from "./live.mjs";
+import { apiOrigin, assertSafeTarget, autoClean, liveToken, scratchRoot, versionFilePayload } from "./live.mjs";
 import { firstLink } from "./links.mjs";
 
 assertSafeTarget();
 const root = path.resolve(scratchRoot("suite-getedits"));
 mkdirSync(root, { recursive: true });
 const token = liveToken();
-const API = "https://api.coderook.com";
+const API = apiOrigin();
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 const entry = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");
 

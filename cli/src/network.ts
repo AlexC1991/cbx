@@ -7,7 +7,6 @@
  * than 250 ms is abandoned too, so a perfectly healthy connection came back as
  * the two words "fetch failed". curl and browsers never showed it.
  */
-import dns from "node:dns";
 import net from "node:net";
 
 /** Called once, before any request. Explicit settings in NODE_OPTIONS win. */
@@ -21,11 +20,26 @@ export function tuneNetwork(): void {
     }
   }
   if (!options.includes("dns-result-order")) {
-    try {
-      dns.setDefaultResultOrder("ipv4first");
-    } catch {
-      /* Older Node: nothing to tune. */
-    }
+    /*
+      Applied just before the first request rather than at start. Loading
+      node:dns sets up its resolver, about twenty milliseconds, which commands
+      that never touch the network (a local status, a local save) were paying
+      on every run. Every request here goes through fetch.
+    */
+    const original = globalThis.fetch;
+    let tuned = false;
+    globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+      if (!tuned) {
+        tuned = true;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          (require("node:dns") as typeof import("node:dns")).setDefaultResultOrder("ipv4first");
+        } catch {
+          /* Older Node: nothing to tune. */
+        }
+      }
+      return original(...args);
+    }) as typeof fetch;
   }
 }
 
@@ -50,18 +64,54 @@ export function describeError(error: unknown): string {
   if (error.name === "TimeoutError") {
     return "CodeRook did not answer in time. Check the connection, then try again.";
   }
-  const cause = (error as { cause?: Cause }).cause;
-  if (error.message === "fetch failed" && cause) {
-    const attempts = cause.errors?.length ? cause.errors : [cause];
+  const cause = (error as { cause?: Cause & { message?: string } }).cause;
+  if (error.message === "terminated") {
+    /*
+      undici's word for an answer whose body stopped arriving: the server
+      hung up mid-reply, or something between here and it did. On its own it
+      read as though the command had been killed.
+    */
+    const detail = [cause?.code, cause?.message].filter(Boolean).join(": ");
+    return (
+      "The connection to CodeRook closed before its answer finished arriving" +
+      (detail ? ` (${detail})` : "") +
+      ". Check the connection, then try again."
+    );
+  }
+  if (error.message === "fetch failed") {
+    /*
+      Said in words first, with the code after for whoever needs it. The most
+      common one, ENOTFOUND, is simply being offline: the name could not be
+      looked up. And a failure that carries no code at all used to fall
+      through to the bare "fetch failed" it exists to replace.
+    */
+    const attempts = cause?.errors?.length ? cause.errors : cause ? [cause] : [];
+    const codes = [...new Set(attempts.map((one) => one.code).filter(Boolean))] as string[];
+    const said = codes.map((code) => PLAIN[code]).find(Boolean);
     const named = attempts
       .map((one) => [one.code, one.address].filter(Boolean).join(" "))
       .filter(Boolean);
-    if (named.length) {
-      return `Could not reach CodeRook (${[...new Set(named)].join(", ")}). Check the connection, then try again.`;
-    }
+    const detail = named.length ? [...new Set(named)].join(", ") : cause?.message ?? "";
+    return (
+      `Could not reach CodeRook${said ? `: ${said}` : ""}` +
+      (detail ? ` (${detail})` : "") +
+      ". Check the connection, then try again."
+    );
   }
   return error.message;
 }
+
+/** What each network failure means, for somebody who has not met the code. */
+const PLAIN: Record<string, string> = {
+  ENOTFOUND: "its address could not be looked up, which usually means this computer is offline",
+  EAI_AGAIN: "its address could not be looked up, which usually means this computer is offline",
+  ECONNREFUSED: "the connection was refused",
+  ECONNRESET: "the connection was dropped",
+  ETIMEDOUT: "the connection timed out",
+  ENETUNREACH: "there is no route to the internet from here",
+  EHOSTUNREACH: "there is no route to the internet from here",
+  UND_ERR_CONNECT_TIMEOUT: "the connection timed out",
+};
 
 /** Wait, for a retry. */
 export function pause(milliseconds: number): Promise<void> {

@@ -18,14 +18,15 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, renameSync } from "node:fs";
 import path from "node:path";
 
-import { assertSafeTarget, autoClean, liveToken, scratchRoot, versionFilePayload } from "./live.mjs";
+import { apiOrigin, assertSafeTarget, autoClean, liveToken, scratchRoot, versionFilePayload } from "./live.mjs";
 import { firstLink } from "./links.mjs";
 
 assertSafeTarget();
 const root = path.resolve(scratchRoot("suite-upgrade"));
 mkdirSync(root, { recursive: true });
 const token = liveToken();
-const API = "https://api.coderook.com";
+/* The service the run is pointed at (CODEROOK_API_URL), not production by default of this file. */
+const API = apiOrigin();
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
 const NEW = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");

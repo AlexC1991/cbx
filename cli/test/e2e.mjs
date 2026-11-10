@@ -12,7 +12,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { assertSafeTarget, autoClean, scratchRoot } from "./live.mjs";
+import { apiOrigin, assertSafeTarget, autoClean, liveToken, scratchRoot } from "./live.mjs";
 
 // Said out loud before anything is created, and cleaned up however this ends.
 assertSafeTarget();
@@ -25,9 +25,19 @@ const ROOT = path.resolve(scratchRoot("suite"));
   It also means the suite no longer needs the package linked globally.
 */
 const ENTRY = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");
-const CONFIG = path.join(process.env.APPDATA, "CodeRook");
-const API = "https://api.coderook.com";
-const token = readFileSync(path.join(CONFIG, "token"), "utf8").trim();
+/* The service the run is pointed at (CODEROOK_API_URL), not production by default of this file. */
+const API = apiOrigin();
+/* The token the run is handed (CODEROOK_TOKEN) first, like every other suite. */
+const token = liveToken();
+/*
+  The suite's own configuration, never the machine's. Without this every
+  command ran against the real %APPDATA%\CodeRook, and "sign-out clears the
+  token" deleted the person's own sign-in; the sign-in test that followed then
+  saved whatever token the run was given in its place (2026-11-06, the owner's
+  CLI was left holding the local test bench's fake token).
+*/
+const CONFIG_HOME = path.join(ROOT, "e2e-config");
+mkdirSync(CONFIG_HOME, { recursive: true });
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
 const results = [];
@@ -43,12 +53,23 @@ function record(name, ok, detail = "") {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${ok || !detail ? "" : `\n        ${detail.replace(/\n/g, "\n        ")}`}`);
 }
 
+/*
+  Signed in through the suite's own configuration only: CODEROOK_TOKEN is not
+  passed on, or sign-out could not be tested and a token in the environment
+  would quietly stand in for the stored one.
+*/
+function suiteEnv() {
+  const env = { ...process.env, NO_COLOR: "1", CODEROOK_CONFIG_DIR: CONFIG_HOME };
+  delete env.CODEROOK_TOKEN;
+  return env;
+}
+
 /** Run the CLI. Never throws: a non-zero exit is a result, not a crash. */
 async function cli(...args) {
   try {
     const { stdout, stderr } = await run(process.execPath, [ENTRY, ...args], {
       maxBuffer: 32 * 1024 * 1024,
-      env: { ...process.env, NO_COLOR: "1" },
+      env: suiteEnv(),
     });
     return { code: 0, out: `${stdout}${stderr}` };
   } catch (error) {
@@ -99,6 +120,7 @@ const project = `suite-${stamp}`;
 const sweep = autoClean((slug) => slug === project, ROOT);
 const work = path.join(ROOT, project);
 
+await cli("sign-in", "--token", token);
 heading("Identity and service");
 await check("doctor reports a healthy service", ["doctor"], (r) =>
   has(r, "Service: ok") && has(r, "Account:"),
@@ -106,7 +128,7 @@ await check("doctor reports a healthy service", ["doctor"], (r) =>
 await check("whoami names the account", ["whoami"], (r) => r.code === 0 && r.out.includes("@"));
 await check("--version prints a version", ["--version"], (r) => /^\d+\.\d+\.\d+/.test(r.out.trim()));
 await check("--help lists every command group", ["--help"], (r) =>
-  has(r, "Getting started", "Working with a folder", "When somebody saved first", "Bundles"),
+  has(r, "Getting started", "Saving work", "Lines, merges and pull requests", "Project settings", "Mods and bundles"),
 );
 await check("an unknown command fails clearly", ["nonsense"], (r) =>
   r.code !== 0 && has(r, "Unknown command"),
@@ -126,7 +148,7 @@ await check("rules shows what is ignored", ["rules", work], (r) => has(r, "node_
 
 heading("Status and submit");
 await check("status on an unsaved folder lists everything", ["status", work], (r) =>
-  has(r, "Not on your account yet") && has(r, "src/main.ts") && !has(r, "node_modules"),
+  has(r, "not linked to a project") && has(r, "src/main.ts") && !has(r, "node_modules"),
 );
 await check("dry run sends nothing", ["submit", work, "-m", "dry", "--dry-run"], (r) =>
   r.code === 0 && has(r, "would be sent"),

@@ -22,12 +22,8 @@ import { Tracks, type Track } from "../../cbx/src/core/tracks.js";
 import { credentials, readLink, writeLink } from "./config.js";
 import type { Parsed } from "./registry.js";
 import { resolveProject } from "./project_commands.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
 
 /** The line a folder saves to when nobody has said otherwise. */
 export const DEFAULT_TRACK = "main";

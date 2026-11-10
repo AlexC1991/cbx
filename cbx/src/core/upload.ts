@@ -8,7 +8,8 @@
  */
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, readFile, stat } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
+import { mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type {
@@ -21,6 +22,7 @@ import { maybeFail } from "./faults.js";
 import { clientHeaders } from "./identify.js";
 import { collectLayers, gitTracked, readRules, surveyFiles } from "./worktree.js";
 import { excludes } from "./rules.js";
+import { engineMeasure, worthTheEngine, type EngineMeasured } from "../shared/native_engine.js";
 import { publishAttemptName } from "./publish_name.js";
 import { encodeForUpload, type Encoded } from "./compress.js";
 import {
@@ -48,8 +50,10 @@ import {
 } from "./retry.js";
 import { PACKABLE_LIMIT, planSections } from "./staging.js";
 import { TransferProgress } from "./transfer_progress.js";
+import { withCompletionProgress } from "./upload_completion.js";
 import {
   createDeltaPatch,
+  createExactDeltaPatch,
   decodeDeltaSignatureBatch,
   encodeDeltaBatchEnvelope,
   encodeDeltaEnvelope,
@@ -58,6 +62,7 @@ import {
   DELTA_BATCH_MAX_FILES,
   DELTA_BATCH_MAX_SOURCE_BYTES,
   DELTA_MAX_FILE_BYTES,
+  type DeltaSignature,
 } from "../shared/delta.js";
 import {
   RepositoryTelemetry,
@@ -127,9 +132,17 @@ function mediaTypeOf(file: string): string {
 }
 
 /** Hash without holding the file in memory; some of these are large. */
-async function digestOf(full: string): Promise<string> {
+async function digestOf(
+  full: string,
+  onBytes?: (read: number) => void,
+): Promise<string> {
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(full)) hash.update(chunk as Buffer);
+  let read = 0;
+  for await (const chunk of createReadStream(full)) {
+    hash.update(chunk as Buffer);
+    read += (chunk as Buffer).byteLength;
+    onBytes?.(read);
+  }
   return hash.digest("hex");
 }
 
@@ -245,6 +258,27 @@ export type UploadRequest = {
   */
   knownDigests?: Map<string, { size: number; mtimeMs: number; sha256: string }>;
   /*
+    A changed file's bytes as the base version holds them, for a caller that
+    keeps them: a local history pushing its saves has every one.
+
+    With them a changed file goes up as an exact patch and nothing is fetched
+    first. Without them the service sends signatures of the base, and a patch
+    built from signatures resends the whole block around each edit: sixteen
+    one-byte edits cost 8.84 KiB that way, 3.26 KiB of it signatures, where
+    Git, which holds the base too, sent 1.62 KiB. Answers that are absent or
+    do not match the base's digest fall back to signatures, file by file.
+  */
+  localBase?: (path: string, sha256: string) => Promise<Uint8Array | null>;
+  /*
+    Where the listings of versions this client made are kept between saves,
+    as `.coderook/versions` under it; the folder being saved when absent.
+    A local history pushing saves from a scratch folder deleted afterwards,
+    so without this every push downloaded its base's whole file list again:
+    17 KB for a one-byte push of a 60-file project, which Git, knowing what
+    it pushed last, never asks for.
+  */
+  listingRoot?: string;
+  /*
     What this save changes, counted by the client over the ticked files.
 
     Recorded rather than derived: the service holds whole files, not diffs,
@@ -253,6 +287,17 @@ export type UploadRequest = {
   */
   linesAdded?: number;
   linesRemoved?: number;
+  /*
+    The same count, taken while the save runs instead of before it.
+
+    Counting meant diffing every ticked file, and the desktop did it before
+    the save began: on a copy of Blender, 5,000 diffs and 104 seconds in which
+    nothing else happened, most of them of libraries and builds with no lines
+    to count. Asked for only when the version is about to be named, so it
+    overlaps the reading and the sending. Its answer replaces linesAdded and
+    linesRemoved; null, or a failure, leaves them as they were.
+  */
+  countLines?: () => Promise<{ added: number; removed: number } | null>;
   /** Paths ticked in the changes list; everything else keeps its old copy. */
   include: string[];
   /*
@@ -317,6 +362,27 @@ export type UploadRequest = {
   */
   known?: Record<string, string>;
 };
+
+/*
+  Version listings already read by this process, by repository and version.
+
+  A save read the version it started from twice — once to plan, once to
+  send — and then read the version it had just made, each time the whole
+  list: three downloads of 6,628 rows to change one line of one file. A
+  version never changes once it exists, so a listing read once is the
+  listing for good.
+*/
+const versionListings = new Map<string, Promise<Array<Record<string, unknown>>>>();
+
+/*
+  Delta signatures, for the same reason: one describes a file of a version
+  that will never change, and the planning pass and the sending pass each
+  asked for it.
+*/
+const signatures = new Map<string, Promise<Uint8Array>>();
+
+/** How many version listings a folder keeps in `.coderook/versions`. */
+const KEPT_LISTINGS = 3;
 
 /** A file the previous version already holds, and the object behind it. */
 /**
@@ -383,6 +449,12 @@ type Selected = {
     deleted: boolean;
     binary: boolean;
     lines: number;
+    /*
+      Where the bytes already are, when that is not this path's own entry in
+      the previous version: a file moved, renamed or copied from one the
+      project already holds.
+    */
+    storedAs?: PriorFile;
   }>;
   deletions: Set<string>;
   /** A ticked path that could not be read, and the reason a person can act on. */
@@ -443,7 +515,23 @@ type Publishing = {
   totalBytes: number;
   progress: TransferProgress;
   report: (progress: UploadProgress) => void;
+  /** Set when the save goes up as one request; see deltaSavePlan. */
+  deltaSave?: DeltaSavePlan;
 };
+
+/** The exact patches of a save whose every changed file has a held base. */
+type DeltaSavePlan = {
+  entries: Array<{ declaration: Declaration; patch: Uint8Array }>;
+  /** The batch envelope that carries them, base version included. */
+  envelope: Uint8Array;
+  patchBytes: number;
+};
+
+/* The largest new file a one-request delta save carries as its own bytes. */
+const DELTA_SAVE_NEW_FILE_BYTES = 1024 * 1024;
+
+/** A delta save the service would not take; the save is sent the ordinary way. */
+class DeltaSaveRefused extends Error {}
 
 type PriorFile = {
   /** Empty for a file the previous version kept in pieces; see `chunks`. */
@@ -486,6 +574,13 @@ export class Uploader {
   private deltaProtocol: 0 | 1 | 2 | null = null;
   /** Batch delta is separate so V2 single-file support remains compatible. */
   private deltaBatchSupported: boolean | null = null;
+  /* Set once the service refuses a one-request delta save; later saves go the ordinary way. */
+  private deltaSaveRefused = false;
+  /* Digests the plan asked about and heard were not held; see storedInBulk. */
+  private plannedAbsent = new Set<string>();
+  /** Batch signatures fetched while pricing a save, used once by the pass that sends it. */
+  private plannedSignatures = new Map<string, Uint8Array>();
+  private versionDeltaSupported: boolean | null = null;
   private microchunkSupported: boolean | null = null;
   /** One shared preflight, so parallel upload lanes cannot race /health. */
   private capabilityRequest: Promise<{
@@ -547,6 +642,8 @@ export class Uploader {
     return new Map(this.plannedDigests);
   }
   private planningCreatedRepositoryId: string | null = null;
+  /** Set once the send has begun to move objects; see execute. */
+  private sendingBegan = false;
   /** Attached to every object write after the server admits the exact plan. */
   private activeQuoteId: string | null = null;
 
@@ -577,6 +674,10 @@ export class Uploader {
       body?: string | Uint8Array;
       contentType?: string;
       retryable?: boolean;
+      onRetry?: (attempt: number, waitMs: number) => void;
+      onAttempt?: (attempt: number) => void;
+      /** How much of the body has been handed to the network, 0..1, as it goes. */
+      onSent?: (fraction: number) => void;
     },
   ): Promise<T> {
     let wait = RETRY_FIRST_WAIT_MS;
@@ -585,6 +686,7 @@ export class Uploader {
       // waiting rather than serve out its backoff first.
       this.check();
       try {
+        init.onAttempt?.(attempt);
         return await this.attempt<T>(route, init);
       } catch (error) {
         // Its own cancellation first: `worthRetrying` knows nothing of it.
@@ -594,6 +696,7 @@ export class Uploader {
         if (init.retryable === false) throw error;
         if (attempt >= RETRY_ATTEMPTS || !worthRetrying(error)) throw error;
         this.telemetry.retry();
+        init.onRetry?.(attempt + 1, wait);
         await this.pause(wait);
         wait *= 2;
       }
@@ -625,9 +728,43 @@ export class Uploader {
       body?: string | Uint8Array;
       contentType?: string;
       retryable?: boolean;
+      onSent?: (fraction: number) => void;
     },
   ): Promise<T> {
     const started = performance.now();
+    /*
+      A body that says how much of itself has gone.
+
+      A batch of small files is one request of a few megabytes, and on an
+      ordinary home connection three of them in flight take ten seconds each.
+      Counted only when the answer came back, the bar stood still for those
+      ten seconds and then jumped — and the last few batches of a save looked
+      exactly like a save that had stopped. Handed over in slices, each slice
+      taken is counted as it is taken, which is what the network has accepted.
+      A fresh stream per attempt, so a retry counts from nothing again.
+    */
+    const streamed =
+      init.onSent && init.body instanceof Uint8Array && init.body.byteLength > 0
+        ? (() => {
+            const whole = init.body as Uint8Array;
+            const report = init.onSent!;
+            const SLICE = 256 * 1024;
+            let at = 0;
+            report(0);
+            return new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (at >= whole.byteLength) {
+                  controller.close();
+                  return;
+                }
+                const next = whole.subarray(at, Math.min(at + SLICE, whole.byteLength));
+                at += next.byteLength;
+                controller.enqueue(next);
+                report(at / whole.byteLength);
+              },
+            });
+          })()
+        : null;
     const token = await this.credentials.token();
     if (!token) throw new Error("Sign in again before uploading");
     const response = await fetch(`${this.credentials.origin()}${route}`, {
@@ -642,7 +779,8 @@ export class Uploader {
           : {}),
         ...(init.contentType ? { "content-type": init.contentType } : {}),
       },
-      body: init.body,
+      body: streamed ?? init.body,
+      ...(streamed ? { duplex: "half" as const } : {}),
       /*
         The upload's own cancellation, and a deadline.
 
@@ -728,6 +866,8 @@ export class Uploader {
     this.planningCreatedRepositoryId = null;
     this.plannedObjects.clear();
     this.plannedLayouts.clear();
+    this.plannedSignatures.clear();
+    this.plannedAbsent.clear();
     try {
       await this.runPass(request, report);
       const quote = this.plannedQuote as UploadPlan | null;
@@ -777,11 +917,23 @@ export class Uploader {
     report: (progress: UploadProgress) => void,
   ): Promise<UploadResult> {
     this.activeQuoteId = plan.quoteId;
+    this.sendingBegan = false;
     try {
       return await this.runPass(
         { ...request, repositoryId: plan.repositoryId },
         report,
       );
+    } catch (error) {
+      /*
+        A first save that stops before a single object has moved leaves no
+        project behind. The plan created it, and it used to stay — empty, at
+        v0 — after a refusal that had just said nothing was changed. Once
+        objects have gone up it stays, because a retry reuses them.
+      */
+      if (plan.repositoryCreated && !this.sendingBegan) {
+        await this.cancelPlan(plan, true).catch(() => undefined);
+      }
+      throw error;
     } finally {
       this.activeQuoteId = null;
     }
@@ -896,7 +1048,11 @@ export class Uploader {
     if (!ticked.size) throw new Error("Nothing is selected to upload");
 
     const prior = request.repositoryId
-      ? await this.versionFiles(request.repositoryId, request.baseVersionId)
+      ? await this.versionFiles(
+          request.repositoryId,
+          request.baseVersionId,
+          request.listingRoot ?? request.localPath,
+        )
       : new Map<string, PriorFile>();
 
     // Ticked files are sent; everything else the project still has keeps the
@@ -1012,9 +1168,88 @@ export class Uploader {
       null,
     );
     let hashed = 0;
+    /*
+      Files whose bytes are no longer the bytes the plan priced.
+
+      The service holds a save to what its plan named, so a file written to
+      between the plan and the send went up as an object nobody had asked
+      for and was refused as "a file that was not part of what it asked to
+      send", with advice to update the app. Found by saving a folder while a
+      program appended to a text file in it. Caught here instead, before
+      anything is sent, and named for what it is.
+    */
+    const changedSincePlan: string[] = [];
     let cursor = 0;
     /** Throttled: twenty thousand sends is its own cost, and nobody reads them. */
     let told = 0;
+    /*
+      Bytes, not just files.
+
+      This said how many files were done and nothing else, so a project whose
+      weight is four 1.6 GB builds sat on "1 of 11" for three minutes on a
+      hard disk and then leapt: every report came after a whole file. The
+      sizes are known from the survey, so how much has been read is a share of
+      a known total, and the lanes say how far into a large file they are.
+    */
+    const readTotal = sending.reduce((sum, file) => sum + file.size, 0);
+    let readDone = 0;
+    const readingNow = new Map<number, number>();
+    const tell = (path: string, force = false) => {
+      const now = Date.now();
+      if (!force && now - told <= 250) return;
+      told = now;
+      let bytes = readDone;
+      for (const partial of readingNow.values()) bytes += partial;
+      report({
+        stage: "hash",
+        files: hashed,
+        totalFiles: sending.length,
+        bytes: Math.min(bytes, readTotal),
+        totalBytes: readTotal,
+        path,
+        /*
+          Reading is the stretch from just past the walk to a fifth of
+          the way through. Starting it at nought put the bar behind where
+          it had already been and it went backwards between stages.
+        */
+        percent: 8 + Math.round((hashed / sending.length) * 12),
+        bytesPerSecond: 0,
+      });
+    };
+    /*
+      Hashed ahead by the native engine, on every core, when there is enough
+      to read to be worth a process. Each answer carries the size and time the
+      file had while it was read, and is used below only when a fresh stat
+      still says the same — so it never vouches for bytes that have moved.
+      Anything it does not answer is hashed here as before.
+    */
+    const ahead = new Map<string, EngineMeasured>();
+    {
+      const unknown = sending.filter((file) => {
+        const remembered =
+          this.plannedDigests.get(file.path) ?? request.knownDigests?.get(file.path);
+        return !(remembered && remembered.size === file.size);
+      });
+      const bytes = unknown.reduce((sum, file) => sum + file.size, 0);
+      if (worthTheEngine(unknown.length, bytes)) {
+        const answered = await timed("hash files", () =>
+          engineMeasure(
+            request.localPath,
+            unknown.map((file) => ({ path: file.path, count: false })),
+            (done, _total, file) => {
+              hashed = done;
+              tell(file);
+            },
+            this.controller.signal,
+          ),
+        );
+        this.check();
+        hashed = 0;
+        for (const [file, one] of answered ?? []) {
+          if (one.sha256 && !one.error && typeof one.mtimeMs === "number") ahead.set(file, one);
+        }
+      }
+    }
     const lane = async (): Promise<void> => {
       for (;;) {
         const index = cursor;
@@ -1038,6 +1273,7 @@ export class Uploader {
             error instanceof Error ? error.message : String(error),
           );
           hashed += 1;
+          readDone += file.size;
           continue;
         }
         /*
@@ -1058,6 +1294,7 @@ export class Uploader {
           and a match there means the digest already taken still describes the
           bytes. Reading is what costs; deciding not to read is free.
         */
+        const fromPlan = this.planning ? undefined : this.plannedDigests.get(file.path);
         const remembered =
           this.plannedDigests.get(file.path) ??
           request.knownDigests?.get(file.path);
@@ -1074,12 +1311,31 @@ export class Uploader {
             mediaType: mediaTypeOf(file.path),
           };
           hashed += 1;
+          readDone += file.size;
           continue;
         }
         let digest: string;
+        const read = ahead.get(file.path);
+        if (read && read.size === size && read.mtimeMs === mtimeMs) {
+          digest = read.sha256!;
+          if (fromPlan && fromPlan.sha256 !== digest) changedSincePlan.push(file.path);
+          this.plannedDigests.set(file.path, { size, mtimeMs, sha256: digest });
+          measured[index] = { path: file.path, full, size, sha256: digest, mediaType: mediaTypeOf(file.path) };
+          hashed += 1;
+          readDone += file.size;
+          tell(file.path, hashed === sending.length);
+          continue;
+        }
         try {
-          digest = await timed("hash files", () => digestOf(full));
+          digest = await timed("hash files", () =>
+            digestOf(full, (read) => {
+              readingNow.set(index, read);
+              tell(file.path);
+            }),
+          );
         } catch (error) {
+          readingNow.delete(index);
+          readDone += file.size;
           vanished.push(file.path);
           readFailures.set(
             file.path,
@@ -1088,6 +1344,7 @@ export class Uploader {
           hashed += 1;
           continue;
         }
+        if (fromPlan && fromPlan.sha256 !== digest) changedSincePlan.push(file.path);
         this.plannedDigests.set(file.path, { size, mtimeMs, sha256: digest });
         measured[index] = {
           path: file.path,
@@ -1097,25 +1354,9 @@ export class Uploader {
           mediaType: mediaTypeOf(file.path),
         };
         hashed += 1;
-        const now = Date.now();
-        if (now - told > 80 || hashed === sending.length) {
-          told = now;
-          report({
-            stage: "hash",
-            files: hashed,
-            totalFiles: sending.length,
-            bytes: 0,
-            totalBytes: 0,
-            path: file.path,
-            /*
-              Reading is the stretch from just past the walk to a fifth of
-              the way through. Starting it at nought put the bar behind where
-              it had already been and it went backwards between stages.
-            */
-            percent: 8 + Math.round((hashed / sending.length) * 12),
-            bytesPerSecond: 0,
-          });
-        }
+        readingNow.delete(index);
+        readDone += file.size;
+        tell(file.path, hashed === sending.length);
       }
     };
     await Promise.all(
@@ -1137,6 +1378,18 @@ export class Uploader {
       throw new Error("Nothing is selected to upload");
     }
 
+    if (changedSincePlan.length) {
+      const one = changedSincePlan.length === 1;
+      const shown = changedSincePlan.slice(0, 5).join(", ");
+      const rest = changedSincePlan.length > 5 ? ` and ${changedSincePlan.length - 5} more` : "";
+      throw new Error(
+        `${changedSincePlan.length} file${one ? "" : "s"} changed while the save was running, ` +
+          `so nothing was sent: ${shown}${rest}. Something is still writing to ${one ? "it" : "them"}. ` +
+          `Save again once ${one ? "it has" : "they have"} stopped changing, or leave ${one ? "it" : "them"} ` +
+          `out — untick ${one ? "it" : "them"} in the app, or add ${one ? "it" : "them"} to .gitignore. ` +
+          `Nothing was changed on your account.`,
+      );
+    }
     return { declarations, totalBytes };
   }
 
@@ -1195,7 +1448,76 @@ export class Uploader {
    * that did not arrive, while past here there is a version. Keeping the
    * boundary a function call rather than a comment makes that legible.
    */
+  /**
+   * Refuse a save that would leave out files somebody chose, naming why.
+   *
+   * Called as soon as the reading is done as well as before the version is
+   * named. Only the second existed, after the plan had already created the
+   * project, so a first save refused for one locked file left an empty
+   * project behind while saying "Nothing was changed on your account".
+   */
+  private refuseUnreadable(dropped: string[], readFailures: Map<string, string>): never {
+    const shown = dropped.slice(0, 5).join(", ");
+    const rest = dropped.length > 5 ? ` and ${dropped.length - 5} more` : "";
+    const details = dropped
+      .map((name) => readFailures.get(name) ? `${name}: ${readFailures.get(name)}` : "")
+      .filter(Boolean)
+      .slice(0, 3)
+      .join("; ");
+    /*
+      Say what to do about it. Refusing is right — a version quietly missing
+      a file somebody chose is the one failure a backup tool must never have
+      — but the message stopped at the refusal, and the person is left with
+      a list of paths and no idea that the fix is either closing whatever
+      holds them or unticking them. Almost every case is a file another
+      program has open, so that is what it says.
+    */
+    /*
+      Each cause named for what it is. Every failure used to be put down to
+      "another program may have a file open", which was wrong for a file
+      this account may not read and for one deleted mid-save, and "untick"
+      means nothing on the command line, where there is nothing to tick.
+      Found by saving a folder with one file held open and one with
+      reading denied.
+    */
+    const reasonOf = (name: string): string => readFailures.get(name) ?? "";
+    const causes = new Set(
+      dropped.map((name) => {
+        const reason = reasonOf(name);
+        if (reason.includes("ignore rules")) return "ignored";
+        if (/EACCES|EPERM|permission|access is denied/i.test(reason)) return "permission";
+        if (/ENOENT|no such file/i.test(reason)) return "gone";
+        return "busy";
+      }),
+    );
+    const said: string[] = [];
+    if (causes.has("busy")) said.push("Another program has a file open: close it.");
+    if (causes.has("permission")) said.push("This account is not allowed to read a file: change its permissions.");
+    if (causes.has("gone")) said.push("A file was deleted or moved while the save was running.");
+    if (causes.has("ignored")) said.push("A file is excluded by the project's ignore rules: change the rules.");
+    throw new Error(
+      `${dropped.length} selected file${dropped.length === 1 ? "" : "s"} could not be included, ` +
+        `so nothing was saved: ${shown}${rest}. ` +
+        `${said.join(" ")} Or leave ${dropped.length === 1 ? "it" : "them"} out — untick ` +
+        `${dropped.length === 1 ? "it" : "them"} in the app, or add ${dropped.length === 1 ? "it" : "them"} ` +
+        `to .gitignore — and save again. ` +
+        `Nothing was changed on your account.` +
+        (details ? ` Details: ${details}` : ""),
+    );
+  }
+
   private async publishVersion(at: Publishing): Promise<UploadResult> {
+    const initial: UploadProgress = {
+      stage: "publish", files: at.declarations.length, totalFiles: at.declarations.length,
+      bytes: at.progress.sentBytes, totalBytes: at.totalBytes, percent: 96,
+      bytesPerSecond: 0, path: "Preparing the file manifest",
+      completion: { phase: "preparing", elapsedSeconds: 0 },
+    };
+    return withCompletionProgress(initial, at.report, (report) =>
+      this.recordVersion({ ...at, report }));
+  }
+
+  private async recordVersion(at: Publishing): Promise<UploadResult> {
     const {
       request,
       repositoryId,
@@ -1214,24 +1536,10 @@ export class Uploader {
     } = at;
     // 4. Name the version, which is what makes the upload visible.
     this.check();
-    report({
-      stage: "publish",
-      files: declarations.length,
-      totalFiles: declarations.length,
-      bytes: progress.sentBytes,
-      totalBytes,
-      /*
-        A save, not a version.
-
-        Sending produces a commit; it becomes a version when somebody names
-        it, which happens later and on purpose. This line said "Recording the
-        version" while doing neither — it was the last wording left over from
-        before the two were separate, and it sat on the one screen a person
-        watches to the end.
-      */
-      path: "Writing down what was sent",
-      percent: 96,
-      bytesPerSecond: progress.rate(),
+    const completing = (phase: NonNullable<UploadProgress["completion"]>["phase"], path: string) => report({
+      stage: "publish", files: declarations.length, totalFiles: declarations.length,
+      bytes: progress.sentBytes, totalBytes, percent: 96, bytesPerSecond: 0,
+      path, completion: { phase, elapsedSeconds: 0 },
     });
 
     // The version names everything the project holds: what was just sent,
@@ -1239,7 +1547,7 @@ export class Uploader {
     const contents: PublishFile[] = [
       ...uploaded,
       ...reused.map((file) => {
-        const held = prior.get(file.path)!;
+        const held = file.storedAs ?? prior.get(file.path)!;
         /*
           Republished in the shape it was already stored in. A file kept in
           pieces names the same pieces; flattening it to one object here would
@@ -1274,7 +1582,7 @@ export class Uploader {
               : { objectId: held.objectId }),
           sourceSize: held.sourceSize,
           storedSize: held.storedSize,
-          mediaType: held.mediaType,
+          mediaType: file.mediaType,
           executable: request.executable?.get(file.path) ?? held.executable,
         };
       }),
@@ -1307,35 +1615,7 @@ export class Uploader {
         ),
       ]),
     ];
-    if (dropped.length) {
-      const shown = dropped.slice(0, 5).join(", ");
-      const rest = dropped.length > 5 ? ` and ${dropped.length - 5} more` : "";
-      const details = dropped
-        .map((name) => readFailures.get(name) ? `${name}: ${readFailures.get(name)}` : "")
-        .filter(Boolean)
-        .slice(0, 3)
-        .join("; ");
-      /*
-        Say what to do about it. Refusing is right — a version quietly missing
-        a file somebody chose is the one failure a backup tool must never have
-        — but the message stopped at the refusal, and the person is left with
-        a list of paths and no idea that the fix is either closing whatever
-        holds them or unticking them. Almost every case is a file another
-        program has open, so that is what it says.
-      */
-      const excluded = dropped.some((name) =>
-        readFailures.get(name)?.includes("ignore rules"),
-      );
-      throw new Error(
-        `${dropped.length} selected file${dropped.length === 1 ? "" : "s"} could not be included, ` +
-          `so nothing was saved: ${shown}${rest}. ` +
-          (excluded
-            ? `At least one is excluded by the project's ignore rules. Change the rules or untick it and try again. `
-            : `Another program may have a file open. Close it or untick the file and try again. `) +
-          `Nothing was changed on your account.` +
-          (details ? ` Details: ${details}` : ""),
-      );
-    }
+    if (dropped.length) this.refuseUnreadable(dropped, readFailures);
 
     const sourceBytes = contents.reduce((total, item) => total + item.sourceSize, 0);
     const storedBytes = contents.reduce((total, item) => total + item.storedSize, 0);
@@ -1347,7 +1627,83 @@ export class Uploader {
     */
     maybeFail("submit:after-objects");
 
-    const completed = await timed("publish the version", () => this.call<{
+    const counted = request.countLines
+      ? await timed("count the changed lines", () => request.countLines!()).catch(() => null)
+      : null;
+    const linesAdded = counted ? counted.added : request.linesAdded;
+    const linesRemoved = counted ? counted.removed : request.linesRemoved;
+
+    /*
+      The version's whole file list, as the service will hold it.
+    */
+    const wire = contents.map((item) => ({
+      path: item.path,
+      ...(item.pack
+        ? {
+            pack: {
+              objectId: item.pack.packObjectId,
+              offset: item.pack.offset,
+              length: item.pack.length,
+            },
+            sha256: item.sha256,
+          }
+        : item.chunks
+          ? { chunks: item.chunks, sha256: item.sha256 }
+          : { objectId: item.objectId }),
+      sourceSize: item.sourceSize,
+      storedSize: item.storedSize,
+      mediaType: item.mediaType,
+      executable: item.executable === true,
+    }));
+    /*
+      Or only what changed (version-delta-v1).
+
+      The list above names every file in the project, so a save of one line
+      in a 6,628-file project sent 2.3 MB describing 6,627 files the service
+      already held exactly that way. When the service can take it, the save
+      names the version it started from, the paths that went, and only the
+      entries that differ from that version; the service fills in the rest
+      from its own record before it checks anything.
+    */
+    const startedFrom =
+      typeof request.baseVersionId === "string" &&
+      prior.size &&
+      (await this.versionDeltaAllowed())
+        ? request.baseVersionId
+        : null;
+    const changesOnly = startedFrom
+      ? {
+          files: wire.filter((entry) => {
+            const before = prior.get(entry.path);
+            return !before || !sameEntry(entry, wireFromPrior(entry.path, before));
+          }),
+          filesFrom: {
+            versionId: startedFrom,
+            removed: [...prior.keys()].filter((held) => !named.has(held)),
+          },
+        }
+      : null;
+
+    /*
+      Names this attempt so a retry after a lost connection is answered with
+      the version already made, rather than making a second one. Named by what
+      each file is: a whole file is its object; a chunked one, or one sent as
+      a patch, is the digest of its contents — so retrying the same publish
+      produces the same key either way, which is the point of it.
+    */
+    const idempotencyKey = publishAttemptName({
+      repositoryId,
+      expectedHeadVersionId: request.expectedHeadVersionId,
+      message: request.message,
+      files: contents.map((item) => ({
+        path: item.path,
+        objectId: item.objectId ?? item.sha256 ?? "",
+      })),
+    });
+
+    const send = (asChanges: boolean) => {
+      completing("confirming", "Files uploaded · waiting for CodeRook to confirm the save");
+      return timed("publish the version", () => this.call<{
       version: {
         id: string;
         sequence: number;
@@ -1365,6 +1721,7 @@ export class Uploader {
         files?: Array<{ path?: string; sha256?: string }>;
       } | null;
       repeated?: boolean;
+      combined?: boolean;
       mergeTrack?: {
         id: string;
         reference: string;
@@ -1373,6 +1730,11 @@ export class Uploader {
     }>(`/v1/repositories/${repositoryId}/versions`, {
       method: "POST",
       contentType: "application/json",
+      onAttempt: (attempt) => {
+        if (attempt > 1) completing("confirming", `Retry ${attempt} · waiting for CodeRook to confirm the save`);
+      },
+      onRetry: (attempt, waitMs) => completing("retrying",
+        `Confirmation interrupted · retry ${attempt} in ${Math.ceil(waitMs / 1000)} s · uploaded files are reused`),
       body: JSON.stringify({
         message: request.message.trim() || "Saved from the CodeRook desktop app",
         ...(request.baseVersionId === undefined
@@ -1388,55 +1750,114 @@ export class Uploader {
         ...(request.allowIgnored ? { allowIgnored: true } : {}),
         ...(this.trackedByGit.length ? { trackedByGit: this.trackedByGit } : {}),
         ...(request.allowSecrets ? { allowSecrets: true } : {}),
-        ...(request.linesAdded === undefined ? {} : { linesAdded: request.linesAdded }),
-        ...(request.linesRemoved === undefined
-          ? {}
-          : { linesRemoved: request.linesRemoved }),
+        ...(linesAdded === undefined ? {} : { linesAdded }),
+        ...(linesRemoved === undefined ? {} : { linesRemoved }),
         /*
           Names this attempt so a retry after a lost connection is answered
           with the version already made, rather than making a second one.
         */
-        idempotencyKey: publishAttemptName({
-          repositoryId,
-          expectedHeadVersionId: request.expectedHeadVersionId,
-          message: request.message,
-          /*
-            Named by what each file is. A whole file is its object; a chunked
-            one is the digest of its contents — so retrying the same publish
-            produces the same key either way, which is the point of it.
-          */
-          files: contents.map((item) => ({
-            path: item.path,
-            objectId: item.objectId ?? item.sha256 ?? "",
-          })),
-        }),
+        idempotencyKey,
         sourceSize: sourceBytes,
         storedSize: storedBytes,
         /*
           One shape or the other, never both — the service refuses a file that
           names an object and a chunk list, and so does its database.
         */
-        files: contents.map((item) => ({
-          path: item.path,
-          ...(item.pack
-            ? {
-                pack: {
-                  objectId: item.pack.packObjectId,
-                  offset: item.pack.offset,
-                  length: item.pack.length,
-                },
-                sha256: item.sha256,
-              }
-            : item.chunks
-              ? { chunks: item.chunks, sha256: item.sha256 }
-              : { objectId: item.objectId }),
-          sourceSize: item.sourceSize,
-          storedSize: item.storedSize,
-          mediaType: item.mediaType,
-          executable: item.executable === true,
-        })),
+        ...(asChanges && changesOnly ? changesOnly : { files: wire }),
       }),
     }));
+    };
+    /*
+      A service that cannot build on the version named (it was taken down,
+      say) answers files_from_*; the whole list is then sent instead, which
+      every service accepts.
+    */
+    type Completed = Awaited<ReturnType<typeof send>> & {
+      /* What a delta save stored, so the listing kept below names real objects. */
+      objects?: Array<{ path: string; objectId: string; storedSize: number }>;
+    };
+    /*
+      The whole save as one request (delta-save-v1): a small header saying
+      what POST /versions would be told, less the file list, then the exact
+      patches. Packed with gzip when that is smaller, which it is once a few
+      paths repeat their folders.
+    */
+    const sendDeltaSave = async (plan: DeltaSavePlan): Promise<Completed> => {
+      const sentHere = new Set(plan.entries.map((entry) => entry.declaration.path));
+      const removed = [...prior.keys()].filter((held) => !named.has(held));
+      const executable = contents
+        .filter((item) => item.executable === true && sentHere.has(item.path))
+        .map((item) => item.path);
+      /* Anything the service assumes by default is left out: the expected head is the base unless said otherwise. */
+      const header = new TextEncoder().encode(JSON.stringify({
+        message: request.message.trim() || "Saved from the CodeRook desktop app",
+        ...(request.expectedHeadVersionId === undefined || request.expectedHeadVersionId === request.baseVersionId
+          ? {}
+          : { expectedHeadVersionId: request.expectedHeadVersionId }),
+        ...(request.track && request.track !== "main" ? { track: request.track } : {}),
+        idempotencyKey,
+        ...(plan.entries.length ? {} : { baseVersionId: request.baseVersionId }),
+        ...(linesAdded === undefined ? {} : { linesAdded }),
+        ...(linesRemoved === undefined ? {} : { linesRemoved }),
+        ...(request.allowIgnored ? { allowIgnored: true } : {}),
+        ...(this.trackedByGit.length ? { trackedByGit: this.trackedByGit } : {}),
+        ...(removed.length ? { removed } : {}),
+        ...(executable.length ? { executable } : {}),
+      }));
+      const rest = new Uint8Array(4 + header.byteLength + plan.envelope.byteLength);
+      new DataView(rest.buffer).setUint32(0, header.byteLength, false);
+      rest.set(header, 4);
+      rest.set(plan.envelope, 4 + header.byteLength);
+      const packed = new Uint8Array(gzipSync(rest, { level: 9 }));
+      const packing = packed.byteLength < rest.byteLength;
+      const body = new Uint8Array(4 + (packing ? packed.byteLength : rest.byteLength));
+      body.set(new TextEncoder().encode(packing ? "CDVZ" : "CDV1"), 0);
+      body.set(packing ? packed : rest, 4);
+      completing("confirming", "Sending the changes · waiting for CodeRook to confirm the save");
+      try {
+        const answer = await timed("send the save as one request", () =>
+          this.call<Completed>(`/v1/repositories/${repositoryId}/versions/delta`, {
+            method: "POST",
+            contentType: "application/vnd.coderook.delta-save; version=1",
+            body,
+          }));
+        progress.finished(
+          plan.entries.reduce((sum, entry) => sum + entry.declaration.size, 0),
+          body.byteLength,
+        );
+        return answer;
+      } catch (error) {
+        const code = (error as { code?: unknown }).code;
+        const status = (error as { status?: unknown }).status;
+        if (
+          (typeof code === "string" && (code.startsWith("delta_") || code.startsWith("files_from_"))) ||
+          status === 404 ||
+          status === 405 ||
+          status === 415
+        ) {
+          throw new DeltaSaveRefused(error instanceof Error ? error.message : String(error));
+        }
+        throw error;
+      }
+    };
+    const completed: Completed = at.deltaSave
+      ? await sendDeltaSave(at.deltaSave)
+      : await send(true).catch((error: unknown) => {
+          const code = (error as { code?: unknown }).code;
+          if (changesOnly && typeof code === "string" && code.startsWith("files_from_")) {
+            return send(false);
+          }
+          throw error;
+        });
+    if (at.deltaSave) {
+      const placed = new Map((completed.objects ?? []).map((one) => [one.path, one]));
+      for (const entry of [...wire, ...uploaded] as Array<{ path: string; objectId?: string; storedSize: number }>) {
+        const one = placed.get(entry.path);
+        if (!one) continue;
+        entry.objectId = one.objectId;
+        entry.storedSize = one.storedSize;
+      }
+    }
 
     /*
       A clean stale-base save may contain a server-side merge. The candidate
@@ -1445,10 +1866,26 @@ export class Uploader {
       instead. A repeated attempt predates manifest echoing, so read that
       Version once rather than guessing.
     */
+    completing("local", "CodeRook confirmed the save · updating local records");
     let acceptedManifest = acceptedManifestDigests(completed.manifest?.files);
-    if (!completed.mergeTrack && !Object.keys(acceptedManifest).length) {
+    /*
+      A service that lists version-delta-v1 also says when it combined this
+      save with somebody else's (`combined`). Without that, and for a repeated
+      attempt, the version that landed may not be the list sent here, so it is
+      read back. Otherwise it is exactly that list, and reading 6,628 rows to
+      learn what was just sent is the third download this used to cost.
+    */
+    const landedAsSent =
+      !completed.mergeTrack &&
+      !completed.repeated &&
+      !completed.combined &&
+      /* A key published on purpose is stored as its covered copy, not as sent. */
+      !request.allowSecrets &&
+      (await this.versionDeltaAllowed());
+    if (!completed.mergeTrack && !landedAsSent && !Object.keys(acceptedManifest).length) {
+      completing("local", "CodeRook confirmed the save · reading the accepted file manifest");
       acceptedManifest = Object.fromEntries(
-        [...(await this.versionFiles(repositoryId, completed.version.id))].map(
+        [...(await this.versionFiles(repositoryId, completed.version.id, request.listingRoot ?? request.localPath))].map(
           ([file, descriptor]) => [file, descriptor.sha256],
         ),
       );
@@ -1458,7 +1895,7 @@ export class Uploader {
       ? acceptedManifest
       : {
           ...Object.fromEntries(
-            reused.map((file) => [file.path, prior.get(file.path)!.sha256]),
+            reused.map((file) => [file.path, (file.storedAs ?? prior.get(file.path)!).sha256]),
           ),
           ...Object.fromEntries(
             declarations.map((declaration) => [declaration.path, declaration.sha256]),
@@ -1476,9 +1913,19 @@ export class Uploader {
       file, which on a 47,000-file project was over a billion comparisons at
       the very end of a save.
     */
+    completing("local", "CodeRook confirmed the save · updating local file records");
     const sentDigest = new Map(
       declarations.map((declaration) => [declaration.path, declaration.sha256]),
     );
+    /*
+      A file named from bytes already stored, at a path the last version did
+      not have, holds those bytes here too. Without this a renamed folder was
+      saved correctly and then reported as "behind" file by file, because this
+      record looked its old digest up by its new path and found nothing.
+    */
+    for (const file of reused) {
+      if (file.storedAs) sentDigest.set(file.path, file.storedAs.sha256);
+    }
     const onDisk = new Set(everything.map((file) => file.path));
     const local: Record<string, string> = Object.fromEntries(
       everything.flatMap((file) => {
@@ -1506,6 +1953,21 @@ export class Uploader {
       if (onDisk.has(path)) continue;
       const held = request.known?.[path];
       if (held) local[path] = held;
+    }
+
+    /*
+      The next save starts from this version, so its listing is kept in the
+      folder now, from the list just sent — every entry with its digest — and
+      that save does not have to download it.
+    */
+    if (landedAsSent && (request.listingRoot ?? request.localPath)) {
+      const rows = wire.map((entry) => ({ ...entry, sha256: manifest[entry.path] }));
+      if (rows.every((row) => typeof row.sha256 === "string" && row.sha256.length === 64)) {
+        const key = `${repositoryId}/${completed.version.id}`;
+        versionListings.set(key, Promise.resolve(rows));
+        completing("local", "CodeRook confirmed the save · caching the file listing for next time");
+        await writeListing(request.listingRoot ?? request.localPath, repositoryId, completed.version.id, rows);
+      }
     }
 
     report({
@@ -1554,6 +2016,7 @@ export class Uploader {
    * rather than before.
    */
   private async sendObjects(at: Sending): Promise<void> {
+    if (!this.planning) this.sendingBegan = true;
     const {
       request,
       repositoryId,
@@ -1610,6 +2073,38 @@ export class Uploader {
       if (count > shown) shown = count;
       return shown;
     };
+    /*
+      Identical files are one upload.
+
+      A folder holding two copies of the same file declares it twice, and both
+      copies used to go up in full: side by side in one batch, or in two lanes
+      at the same moment. The second copy now waits for the first to finish,
+      after which the service already holds the bytes and the copy costs a
+      question rather than a transfer.
+    */
+    const inFlightByDigest = new Map<string, Promise<void>>();
+    /*
+      What the account already holds, asked once for the whole save.
+
+      Asked per section, the answer changed under the save's feet. The plan
+      stores nothing, so every section of the plan heard the same answer; the
+      send stores as it goes and runs sections side by side, so a later
+      section holding a copy of a file an earlier one had just sent heard
+      "already held" and left it out of its pack. The pack's bytes, and so its
+      digest, were then not the pack the plan had priced, and the service
+      refused it as "a file that was not part of what it asked to send". A
+      copy of Blender 4.5 — 326 contents present more than once — failed this
+      way every time. One answer, taken before anything is sent, is the answer
+      the plan was given.
+    */
+    let heldOnce: Promise<Map<string, { objectId: string; size: number }>> | null = null;
+    const heldAtStart = () =>
+      (heldOnce ??= timed("ask what is already held", () =>
+        this.storedInBulk(
+          repositoryId,
+          everyDeclaration.map((one) => one.sha256),
+        ),
+      ));
     const runSection = async (section: (typeof sections)[number]) => {
       const declarations = section.files.map(
         (file) => declarationByPath.get(file.path)!,
@@ -1670,12 +2165,7 @@ export class Uploader {
       asking took longer than the transfer. The answer per digest is a boolean
       and an identifier, so the whole question fits in one request.
     */
-    const alreadyHeld = await timed("ask what is already held", () =>
-      this.storedInBulk(
-        repositoryId,
-        declarations.map((one) => one.sha256),
-      ),
-    );
+    const alreadyHeld = await heldAtStart();
 
     /*
       The small files go first, packed together.
@@ -1689,6 +2179,17 @@ export class Uploader {
       (one) => !alreadyHeld.has(one.sha256),
     );
     const smallOnes = missing.filter((one) => one.size <= BATCH_FILE_LIMIT);
+    /* The first file with each digest is sent; the rest are counted when it lands. */
+    const copiesOf = new Map<string, Declaration[]>();
+    const smallUnique = smallOnes.filter((one) => {
+      const copies = copiesOf.get(one.sha256);
+      if (copies) {
+        copies.push(one);
+        return false;
+      }
+      copiesOf.set(one.sha256, []);
+      return true;
+    });
 
     // 3. Send the objects.
     /*
@@ -1717,6 +2218,7 @@ export class Uploader {
           request.baseVersionId!,
           held,
           deltaDeclaration,
+          request.localBase,
         ),
       );
       if (placed) {
@@ -1728,7 +2230,7 @@ export class Uploader {
         counted("files sent as deltas", 1);
       }
     }
-    const smallForPacking = smallOnes.filter(
+    const smallForPacking = smallUnique.filter(
       (one) => !batched.has(one.sha256),
     );
     if (smallForPacking.length > 1) {
@@ -1738,6 +2240,19 @@ export class Uploader {
         encoded: Encoded;
       }> = [];
       let packBytes = 0;
+      /* How many batches have had a lane of their own on the bar. */
+      let batchLanes = 0;
+      /*
+        How long a source byte takes to land in a batch on this connection,
+        learned from the batches that have landed.
+
+        Counting the body as it is handed over is not enough on its own: the
+        operating system takes a few megabytes into its send buffer at once,
+        so a whole batch reads as sent within a moment and then waits seconds
+        for the wire. A batch in flight is shown no further along than its
+        time so far at the pace earlier batches actually managed.
+      */
+      let secondsPerByte = 0;
       /*
         Batches overlap rather than queue.
 
@@ -1752,12 +2267,69 @@ export class Uploader {
         that is reasonable to have outstanding.
       */
       const BATCH_LANES = 3;
+      /*
+        Time against the expected time, as a share of a batch: in step until
+        nine tenths, then closing on the end without reaching it, so a batch
+        that runs late keeps moving and never reads as landed before its
+        answer says so.
+      */
+      const creep = (expectedShare: number) =>
+        expectedShare <= 0.9
+          ? Math.max(0, expectedShare)
+          : 0.9 + 0.09 * (1 - Math.exp(-(expectedShare - 0.9) / 0.3));
       const flying = new Set<Promise<void>>();
       const flush = async () => {
         if (!pack.length) return;
         const taking = pack;
         pack = [];
         packBytes = 0;
+        /*
+          This batch's own lane on the bar, keyed below zero so it can never
+          collide with a file's lane. Its source bytes are shared out as its
+          body goes, and taken back off when the batch lands and is counted
+          for real.
+        */
+        batchLanes += 1;
+        const lane = -batchLanes;
+        const batchSource = taking.reduce((sum, item) => sum + item.declaration.size, 0);
+        let toldAt = 0;
+        let handed = 0;
+        const sentAt = Date.now();
+        const show = () => {
+          /*
+            Until a batch has landed there is no pace of this connection to go
+            by, and the first batches read as sent within a moment and then
+            stood still for seconds. A cautious guess stands in until the first
+            answer: a megabyte and a half a second, shared by the batches in
+            flight. Too slow a guess costs only a jump forward when the batch
+            lands; too fast a one would be the stall again.
+          */
+          const pace = secondsPerByte > 0 ? secondsPerByte : BATCH_LANES / 1_500_000;
+          const elapsed = (Date.now() - sentAt) / 1000;
+          const share =
+            batchSource > 0 ? Math.min(handed, creep(elapsed / (pace * batchSource))) : handed;
+          progress.lane(lane, Math.round(batchSource * share));
+          const now = Date.now();
+          if (now - toldAt < 250) return;
+          toldAt = now;
+          report({
+            stage: "upload",
+            files: advance(0),
+            totalFiles: everyDeclaration.length,
+            bytes: progress.bytes(),
+            totalBytes,
+            path: taking[taking.length - 1]!.declaration.path,
+            percent:
+              20 + Math.round((progress.bytes() / Math.max(totalBytes, 1)) * 72),
+            bytesPerSecond: progress.rate(),
+          });
+        };
+        const onSent = (fraction: number) => {
+          handed = fraction;
+          show();
+        };
+        /* Keeps the estimate moving while the batch waits on the wire. */
+        const pacing = setInterval(show, 300);
         const task = (async () => {
         let exactWireBytes: number | null = null;
         try {
@@ -1789,6 +2361,7 @@ export class Uploader {
                   taking,
                   prior,
                   packedBytes,
+                  request.localBase,
                 ),
               )
             : null;
@@ -1799,7 +2372,7 @@ export class Uploader {
           }
           const placed = !delta && built
             ? await timed("send packs", () =>
-                this.putPack(repositoryId, packItems, built),
+                this.putPack(repositoryId, packItems, built, onSent),
               )
             : null;
           if (placed) {
@@ -1812,7 +2385,7 @@ export class Uploader {
               They still travel together, just as separate objects.
             */
             const answer = await timed("send batches", () =>
-              this.putBatch(repositoryId, taking),
+              this.putBatch(repositoryId, taking, onSent),
             );
             counted("files sent in batches", taking.length);
             for (const [digest, one] of answer) batched.set(digest, one);
@@ -1843,6 +2416,13 @@ export class Uploader {
           below and counted a second time — which is how the progress bar came
           to report a hundred and twenty percent of a forty megabyte upload.
         */
+        /* Landed or refused, its estimate comes off: what landed is counted below. */
+        clearInterval(pacing);
+        progress.laneDone(lane);
+        if (batchSource > 0 && taking.some((item) => batched.has(item.declaration.sha256) || packedInto.has(item.declaration.sha256))) {
+          const took = (Date.now() - sentAt) / 1000 / batchSource;
+          secondsPerByte = secondsPerByte > 0 ? secondsPerByte * 0.6 + took * 0.4 : took;
+        }
         for (const item of taking) {
           const digest = item.declaration.sha256;
           if (!batched.has(digest) && !packedInto.has(digest)) continue;
@@ -1850,6 +2430,7 @@ export class Uploader {
             item.declaration.size,
             exactWireBytes === null ? item.encoded.body.byteLength : 0,
           );
+          for (const copy of copiesOf.get(digest) ?? []) progress.finished(copy.size, 0);
         }
         if (exactWireBytes !== null) progress.finished(0, exactWireBytes);
         report({
@@ -1863,7 +2444,10 @@ export class Uploader {
             20 + Math.round((progress.bytes() / Math.max(totalBytes, 1)) * 72),
           bytesPerSecond: progress.rate(),
         });
-        })().finally(() => flying.delete(task));
+        })().finally(() => {
+          clearInterval(pacing);
+          flying.delete(task);
+        });
         flying.add(task);
         if (flying.size >= BATCH_LANES) await Promise.race(flying);
       };
@@ -1911,6 +2495,15 @@ export class Uploader {
     const queue = declarations.entries();
     const runWorker = async () => {
       for (const [index, declaration] of queue) {
+      const earlier = inFlightByDigest.get(declaration.sha256);
+      if (earlier) await earlier;
+      let release = () => {};
+      if (!earlier) {
+        inFlightByDigest.set(declaration.sha256, new Promise<void>((done) => {
+          release = done;
+        }));
+      }
+      try {
       this.check();
       report({
         stage: "upload",
@@ -1949,6 +2542,7 @@ export class Uploader {
         declaration.size >= CHUNK_THRESHOLD &&
         (await this.chunkingAllowed())
       ) {
+        const priorFile = prior.get(declaration.path);
         const pieces = await this.putChunked(
           repositoryId,
           declaration,
@@ -1968,6 +2562,10 @@ export class Uploader {
               bytesPerSecond: progress.rate(),
             });
           },
+          /* The previous version's copy of this file, kept in pieces: what a changed piece is patched against. */
+          request.baseVersionId && priorFile?.chunks?.length && priorFile.sha256
+            ? { baseVersionId: request.baseVersionId, baseSha256: priorFile.sha256, baseSize: priorFile.sourceSize }
+            : undefined,
         );
         progress.laneDone(index);
         /*
@@ -2062,6 +2660,9 @@ export class Uploader {
         mediaType: declaration.mediaType,
       });
       progress.finished(declaration.size, alreadyStored ? 0 : declaration.size);
+      } finally {
+        release();
+      }
       }
     };
     await Promise.all(
@@ -2125,6 +2726,11 @@ export class Uploader {
       report,
     );
     /*
+      Before the project is created or anything priced: see refuseUnreadable.
+      `vanished` holds every chosen file that is gone or could not be read.
+    */
+    if (vanished.length) this.refuseUnreadable([...new Set(vanished)], readFailures);
+    /*
       A file that is exactly what the last version held is kept, not sent.
 
       Both callers select everything — the command line says so with an empty
@@ -2139,32 +2745,99 @@ export class Uploader {
       same bytes, and the previous version's object for them — a pack slice,
       its chunks, or a plain object — is named again instead.
     */
-    const keptAsItWas = (declaration: Declaration): boolean => {
+    const stored = (was: PriorFile | undefined): was is PriorFile =>
+      !!was && !!(was.pack?.objectId || was.chunks?.length || was.objectId);
+    /*
+      Matched by what a file is, not only by where it sits.
+
+      Same path and same bytes was the only reuse, so renaming a folder sent
+      every file in it again: the service recognises a stored object by its
+      digest but not a slice of a pack, and small files live in packs. Moving
+      a 2,192-file folder in a copy of the Cheat Engine sources re-sent all of
+      it, 5.5 MB, to record bytes the project already held. Any file in the
+      previous version with the same digest is the same bytes, wherever it was.
+    */
+    const priorByDigest = new Map<string, PriorFile>();
+    for (const was of prior.values()) {
+      if (stored(was) && !priorByDigest.has(was.sha256)) priorByDigest.set(was.sha256, was);
+    }
+    const storedAs = (declaration: Declaration): PriorFile | null => {
       const was = prior.get(declaration.path);
-      return (
-        !!was &&
-        was.sha256 === declaration.sha256 &&
-        !deletions.has(declaration.path) &&
-        !!(was.pack?.objectId || was.chunks?.length || was.objectId)
-      );
+      if (stored(was) && was.sha256 === declaration.sha256) return was;
+      return priorByDigest.get(declaration.sha256) ?? null;
     };
-    const declarations = hashed.declarations.filter((one) => !keptAsItWas(one));
+    const keptAsItWas = (declaration: Declaration): boolean =>
+      storedAs(declaration) !== null;
+    /*
+      A copy left stale by somebody else's save is not an edit.
+
+      Both callers select everything, so a file nobody touched here is still
+      "selected". When the version this save starts from holds a newer copy,
+      merged in from somebody else, the untouched old bytes on this disk
+      differ from it, and they were sent as though they were a change: the
+      second unrelated save after a colleague's edit put their file back to
+      what it was (state-matrix R1, reproduced 2026-11-06: v4 reverted v2).
+
+      What the file IS decides it, not where it sits: bytes identical to what
+      this folder last received (request.known) are not this person's work.
+      The version's own copy is kept, and the folder's record still says it
+      received the old bytes, so the file shows as behind until fetched. A
+      file the version no longer holds at all was removed by somebody else,
+      and an untouched copy here does not bring it back.
+    */
+    const received = request.known ?? null;
+    const staleHere = new Set<string>();
+    if (received && prior.size) {
+      for (const one of hashed.declarations) {
+        if (received[one.path] !== one.sha256) continue;
+        const now = prior.get(one.path);
+        if (now && now.sha256 === one.sha256) continue;
+        staleHere.add(one.path);
+      }
+    }
+    const declarations = hashed.declarations.filter(
+      (one) => !staleHere.has(one.path) && !keptAsItWas(one),
+    );
     let totalBytes = hashed.totalBytes;
     for (const one of hashed.declarations) {
-      if (!keptAsItWas(one)) continue;
+      if (!staleHere.has(one.path)) continue;
       totalBytes -= one.size;
-      const held = prior.get(one.path)!;
+      const now = prior.get(one.path);
+      if (!now) {
+        ticked.delete(one.path);
+        continue;
+      }
       reused.push({
         path: one.path,
-        sourceSize: held.sourceSize,
-        storedSize: held.storedSize,
-        mediaType: held.mediaType,
+        sourceSize: now.sourceSize,
+        storedSize: now.storedSize,
+        mediaType: now.mediaType,
         added: 0,
         removed: 0,
         included: true,
         deleted: false,
         binary: false,
         lines: 0,
+      });
+    }
+    counted("stale copies kept as the version has them", staleHere.size);
+    for (const one of hashed.declarations) {
+      if (staleHere.has(one.path)) continue;
+      const held = storedAs(one);
+      if (!held) continue;
+      totalBytes -= one.size;
+      reused.push({
+        path: one.path,
+        sourceSize: held.sourceSize,
+        storedSize: held.storedSize,
+        mediaType: one.mediaType,
+        added: 0,
+        removed: 0,
+        included: true,
+        deleted: false,
+        binary: false,
+        lines: 0,
+        ...(held === prior.get(one.path) ? {} : { storedAs: held }),
       });
     }
     counted("files kept as they were", hashed.declarations.length - declarations.length);
@@ -2249,6 +2922,99 @@ export class Uploader {
       and eighteen in the other, which is not two pipelines. Judging by the
       share of bytes that will be batched splits the same game nine and twelve.
     */
+    /*
+      A save of edited files whose bases this client holds goes up as one
+      request (delta-save-v1): the exact patches and the version together, as
+      a Git push carries its objects and its commit in one pack. Nothing is
+      asked about first and nothing is priced object by object; the plan still
+      asks the service for the account's storage and allowance, with an empty
+      object list, so what a person is shown before saving stays true.
+    */
+    const oneRequest = this.deltaSaveRefused
+      ? null
+      : await this.deltaSavePlan(request, repositoryId, declarations, prior);
+    if (oneRequest && this.planning) {
+      report({
+        stage: "publish",
+        files: declarations.length,
+        totalFiles: declarations.length,
+        bytes: 0,
+        totalBytes,
+        path: "Checking storage and monthly allowance",
+        percent: 96,
+        bytesPerSecond: 0,
+      });
+      this.plannedQuote = await this.call<UploadPlan>(
+        `/v1/repositories/${repositoryId}/uploads/preflight`,
+        {
+          method: "POST",
+          contentType: "application/json",
+          body: JSON.stringify({
+            sourceBytes: totalBytes,
+            excludedBytes: 0,
+            objects: [],
+            track: request.track ?? "main",
+          }),
+        },
+      );
+      return {
+        repositoryId,
+        versionId: "",
+        sequence: 0,
+        sourceBytes: totalBytes,
+        storedBytes: this.plannedQuote.compactedBytes,
+        sentBytes: oneRequest.patchBytes,
+        sentFiles: oneRequest.entries.length,
+        reusedFiles: reused.length,
+        alreadyStoredFiles: 0,
+        manifest: {},
+        local: {},
+        telemetry: this.telemetry.snapshot(),
+      };
+    }
+    if (oneRequest) {
+      this.sendingBegan = true;
+      for (const entry of oneRequest.entries) {
+        uploaded.push({
+          path: entry.declaration.path,
+          sha256: entry.declaration.sha256,
+          sourceSize: entry.declaration.size,
+          storedSize: 0,
+          mediaType: entry.declaration.mediaType,
+        });
+      }
+      try {
+        return await this.publishVersion({
+          request,
+          repositoryId,
+          declarations,
+          uploaded,
+          reused,
+          prior,
+          everything,
+          ticked,
+          deletions,
+          readFailures,
+          vanished,
+          totalBytes,
+          progress,
+          report,
+          deltaSave: oneRequest,
+        });
+      } catch (error) {
+        if (!(error instanceof DeltaSaveRefused)) throw error;
+        /*
+          Refused as a delta save (an old base, a patch that did not rebuild):
+          sent the ordinary way instead. The plan's quote priced no objects,
+          so the objects go up unquoted, as they did before quotes existed.
+        */
+        this.deltaSaveRefused = true;
+        this.activeQuoteId = null;
+        uploaded.length = 0;
+        counted("delta saves sent the ordinary way", 1);
+      }
+    }
+
     await this.sendObjects({
       request,
       repositoryId,
@@ -2332,6 +3098,8 @@ export class Uploader {
   private async versionFiles(
     repositoryId: string,
     versionId?: string | null,
+    /** The project folder, whose `.coderook/versions` keeps listings between runs. */
+    localPath?: string,
   ): Promise<Map<string, PriorFile>> {
     const held = new Map<string, PriorFile>();
     try {
@@ -2346,12 +3114,8 @@ export class Uploader {
         wanted = (versions.versions ?? [])[0]?.id;
       }
       if (!wanted) return held;
-      const body = await this.call<{
-        files?: Array<Record<string, unknown>>;
-      }>(`/v1/repositories/${repositoryId}/versions/${wanted}/files`, {
-        method: "GET",
-      });
-      for (const row of body.files ?? []) {
+      const rows = await this.listing(repositoryId, wanted, localPath);
+      for (const row of rows) {
         const pieces = Array.isArray(row.chunks)
           ? (row.chunks as Array<Record<string, unknown>>).map((chunk) => ({
               objectId: String(chunk.objectId ?? ""),
@@ -2386,6 +3150,41 @@ export class Uploader {
       // simply contain only what is being sent now.
     }
     return held;
+  }
+
+  /**
+   * A version's files, as the service lists them: from this process's memo,
+   * then the folder's own cache, and only then from the service.
+   *
+   * The folder cache is what makes the next save cheap: the version a save
+   * starts from is nearly always the one the previous save made, and that
+   * one is written here by the save that made it (rememberListing).
+   */
+  private async listing(
+    repositoryId: string,
+    versionId: string,
+    localPath?: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    const key = `${repositoryId}/${versionId}`;
+    const known = versionListings.get(key);
+    if (known) return known;
+    const reading = (async () => {
+      const cached = localPath
+        ? await readListing(localPath, repositoryId, versionId)
+        : null;
+      if (cached) return cached;
+      const body = await this.call<{
+        files?: Array<Record<string, unknown>>;
+      }>(`/v1/repositories/${repositoryId}/versions/${versionId}/files`, {
+        method: "GET",
+      });
+      const rows = body.files ?? [];
+      if (localPath) await writeListing(localPath, repositoryId, versionId, rows);
+      return rows;
+    })();
+    versionListings.set(key, reading);
+    reading.catch(() => versionListings.delete(key));
+    return reading;
   }
 
   /** The account's repository with this slug, if it has one. */
@@ -2452,6 +3251,7 @@ export class Uploader {
     repositoryId: string,
     items: Array<{ declaration: Declaration; body: Uint8Array }>,
     alreadyBuilt?: SolidPack,
+    onSent?: (fraction: number) => void,
   ): Promise<Map<
     string,
     { packObjectId: string; offset: number; length: number; storedSize: number }
@@ -2499,6 +3299,7 @@ export class Uploader {
         method: "POST",
         contentType: "application/octet-stream",
         body: packed,
+        ...(onSent ? { onSent } : {}),
       },
     );
     const placed = new Map<
@@ -2557,6 +3358,7 @@ export class Uploader {
     items: Array<{ declaration: Declaration; body: Uint8Array; encoded: Encoded }>,
     prior: Map<string, PriorFile>,
     solidPackBytes: number,
+    localBase?: UploadRequest["localBase"],
   ): Promise<{
     objects: Map<string, { objectId: string; size: number }>;
     sentBytes: number;
@@ -2569,7 +3371,6 @@ export class Uploader {
       !(await this.deltaBatchAllowed())
     ) return null;
     let sourceBytes = 0;
-    let signatureEstimate = 6 + items.length * 4;
     const bases: PriorFile[] = [];
     for (const item of items) {
       const base = prior.get(item.declaration.path);
@@ -2585,46 +3386,50 @@ export class Uploader {
       ) return null;
       sourceBytes += item.declaration.size;
       if (sourceBytes > DELTA_BATCH_MAX_SOURCE_BYTES) return null;
-      signatureEstimate += estimateDeltaSignatureBytes(base.sourceSize, 2);
       bases.push(base);
+    }
+    /* The bases held here need no signature; only the rest are asked for. */
+    const held = await Promise.all(
+      items.map((item, index) => this.localBaseBytes(localBase, item.declaration.path, bases[index]!)),
+    );
+    const asking = items.flatMap((_, index) => (held[index] ? [] : [index]));
+    let signatureEstimate = asking.length ? 6 + asking.length * 4 : 0;
+    for (const index of asking) {
+      signatureEstimate += estimateDeltaSignatureBytes(bases[index]!.sourceSize, 2);
     }
     if (signatureEstimate >= solidPackBytes * 0.8) return null;
 
     try {
-      const token = await this.credentials.token();
-      if (!token) return null;
-      const response = await fetch(
-        `${this.credentials.origin()}/v1/repositories/${repositoryId}/objects/delta/signatures`,
-        {
-          method: "POST",
-          headers: {
-            accept: "application/vnd.coderook.delta-signature-batch; version=2",
-            authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-            "user-agent": "CodeRook/0.1",
-            ...clientHeaders(),
-          },
-          body: JSON.stringify({
+      /*
+        Signatures describe the base version's files, which never change, so
+        the ones fetched while pricing the save are the ones sending it needs.
+        Fetching them again in the sending pass doubled what a batch of edits
+        cost on the wire: 16 one-byte edits measured 12.1 KiB, against 8.8 KiB
+        with one fetch.
+      */
+      const signatureBytes = asking.length
+        ? await this.signatureBatch(
+            repositoryId,
             baseVersionId,
-            files: items.map((item, index) => ({
-              path: item.declaration.path,
+            asking.map((index) => ({
+              path: items[index]!.declaration.path,
               baseSha256: bases[index]!.sha256,
             })),
-          }),
-          signal: this.controller.signal,
-        },
-      );
-      if (!response.ok) return null;
-      const signatureBytes = new Uint8Array(await response.arrayBuffer());
-      const signatures = decodeDeltaSignatureBatch(signatureBytes);
-      if (signatures.length !== items.length) return null;
+          )
+        : new Uint8Array(0);
+      if (!signatureBytes) return null;
+      const signatures = asking.length ? decodeDeltaSignatureBatch(signatureBytes) : [];
+      if (signatures.length !== asking.length) return null;
+      const signatureFor = new Map(asking.map((index, at) => [index, signatures[at]!]));
       const framed = encodeDeltaBatchEnvelope({
         baseVersionId,
         entries: items.map((item, index) => ({
           path: item.declaration.path,
           sha256: item.declaration.sha256,
           mediaType: item.declaration.mediaType,
-          patch: createDeltaPatch(item.body, signatures[index]!),
+          patch: held[index]
+            ? createExactDeltaPatch(held[index]!, item.body)
+            : createDeltaPatch(item.body, signatureFor.get(index)!),
         })),
       });
       const wireBytes = signatureBytes.byteLength + framed.byteLength;
@@ -2691,6 +3496,7 @@ export class Uploader {
     baseVersionId: string,
     prior: PriorFile,
     declaration: Declaration,
+    localBase?: UploadRequest["localBase"],
   ): Promise<{
     objectId: string;
     storedSize: number;
@@ -2698,6 +3504,9 @@ export class Uploader {
   } | null> {
     const deltaVersion = await this.deltaVersion();
     if (deltaVersion === 0) return null;
+    const held = deltaVersion === 2
+      ? await this.localBaseBytes(localBase, declaration.path, prior)
+      : null;
     let target: Uint8Array;
     try {
       target = new Uint8Array(await readFile(declaration.full));
@@ -2716,20 +3525,25 @@ export class Uploader {
       prior.sourceSize,
       deltaVersion,
     );
-    if (signatureEstimate >= ordinary.body.byteLength * 0.8) return null;
+    if (!held && signatureEstimate >= ordinary.body.byteLength * 0.8) return null;
 
     try {
-      const signatureBytes = await this.deltaSignature(
-        repositoryId,
-        baseVersionId,
-        declaration.path,
-        prior.sha256,
-        deltaVersion,
-      );
-      const signature = parseDeltaSignature(signatureBytes);
-      const patch = createDeltaPatch(target, signature);
+      /* A base held here is patched against directly, with nothing fetched. */
+      const signatureBytes = held
+        ? new Uint8Array(0)
+        : await this.deltaSignature(
+            repositoryId,
+            baseVersionId,
+            declaration.path,
+            prior.sha256,
+            deltaVersion,
+          );
+      const signature = held ? null : parseDeltaSignature(signatureBytes);
+      const patch = held
+        ? createExactDeltaPatch(held, target)
+        : createDeltaPatch(target, signature!);
       let framed: Uint8Array;
-      if (signature.version === 2) {
+      if (held || signature!.version === 2) {
         framed = encodeDeltaEnvelope({
           baseVersionId,
           path: declaration.path,
@@ -2790,7 +3604,202 @@ export class Uploader {
     }
   }
 
-  private async deltaSignature(
+  /**
+   * The one-request delta save for this selection, or null when it does not
+   * apply: every file being sent must be an edit of a file the base version
+   * holds at the same path, small enough for the delta transport, with its
+   * base held by the caller. A key published on purpose is stored as its
+   * covered copy, not as sent, so those saves keep the ordinary path.
+   */
+  private async deltaSavePlan(
+    request: UploadRequest,
+    repositoryId: string,
+    declarations: Declaration[],
+    prior: Map<string, PriorFile>,
+  ): Promise<DeltaSavePlan | null> {
+    if (
+      request.allowSecrets ||
+      typeof request.baseVersionId !== "string" ||
+      !prior.size ||
+      declarations.length > DELTA_BATCH_MAX_FILES ||
+      !(await this.serviceFeatures()).includes("delta-save-v1")
+    ) return null;
+    let sourceBytes = 0;
+    for (const declaration of declarations) {
+      const base = prior.get(declaration.path);
+      if (
+        (base && !base.sha256) ||
+        declaration.size > DELTA_MAX_FILE_BYTES ||
+        (base?.sourceSize ?? 0) > DELTA_MAX_FILE_BYTES
+      ) return null;
+      sourceBytes += declaration.size;
+      if (sourceBytes > DELTA_BATCH_MAX_SOURCE_BYTES) return null;
+    }
+    /*
+      Three ways a file goes in, cheapest first. An edit whose base is held
+      here is patched against it exactly. An edit whose base is not is patched
+      against the service's signatures of it, fetched in one request, when
+      those are worth fetching. Anything else small enough goes as its own
+      bytes, a literal patch any base rebuilds: a new file, or a rewrite that
+      shares nothing. Past a megabyte that is not taken, and the save goes the
+      ordinary way, where chunks and packs can find what is already held.
+    */
+    const targets: Uint8Array[] = [];
+    const held: Array<Uint8Array | null> = [];
+    const signed: number[] = [];
+    for (const [index, declaration] of declarations.entries()) {
+      let target: Uint8Array;
+      try {
+        target = new Uint8Array(await readFile(declaration.full));
+      } catch {
+        return null;
+      }
+      if (createHash("sha256").update(target).digest("hex") !== declaration.sha256) return null;
+      targets.push(target);
+      const was = prior.get(declaration.path);
+      const base = was ? await this.localBaseBytes(request.localBase, declaration.path, was) : null;
+      held.push(base);
+      if (base) continue;
+      if (was && estimateDeltaSignatureBytes(was.sourceSize, 2) < declaration.size * 0.8) {
+        signed.push(index);
+      } else if (declaration.size > DELTA_SAVE_NEW_FILE_BYTES) {
+        return null;
+      }
+    }
+    let signatureFor = new Map<number, DeltaSignature>();
+    let signatureBytes = 0;
+    if (signed.length) {
+      const fetched = await this.signatureBatch(
+        repositoryId,
+        request.baseVersionId,
+        signed.map((index) => ({
+          path: declarations[index]!.path,
+          baseSha256: prior.get(declarations[index]!.path)!.sha256,
+        })),
+      );
+      if (!fetched) return null;
+      try {
+        const signatures = decodeDeltaSignatureBatch(fetched);
+        if (signatures.length !== signed.length) return null;
+        signatureFor = new Map(signed.map((index, at) => [index, signatures[at]!]));
+      } catch {
+        return null;
+      }
+      signatureBytes = fetched.byteLength;
+    }
+    const entries: DeltaSavePlan["entries"] = declarations.map((declaration, index) => {
+      const target = targets[index]!;
+      const base = held[index];
+      const signature = signatureFor.get(index);
+      return {
+        declaration,
+        patch: base
+          ? createExactDeltaPatch(base, target)
+          : signature
+            ? createDeltaPatch(target, signature)
+            : createExactDeltaPatch(new Uint8Array(0), target),
+      };
+    });
+    counted("signature bytes for the delta save", signatureBytes);
+    /* A save that only deletes carries no envelope; its header names the base. */
+    const envelope = !entries.length ? new Uint8Array(0) : encodeDeltaBatchEnvelope({
+      baseVersionId: request.baseVersionId,
+      entries: entries.map((entry) => ({
+        path: entry.declaration.path,
+        sha256: entry.declaration.sha256,
+        mediaType: entry.declaration.mediaType,
+        patch: entry.patch,
+      })),
+    });
+    return {
+      entries,
+      envelope,
+      patchBytes: entries.reduce((sum, entry) => sum + entry.patch.byteLength, 0),
+    };
+  }
+
+  /**
+   * Signatures of several base files in one request, or null when refused.
+   *
+   * Signatures describe the base version's files, which never change, so
+   * the ones fetched while pricing the save are the ones sending it needs.
+   * Fetching them again in the sending pass doubled what a batch of edits
+   * cost on the wire: 16 one-byte edits measured 12.1 KiB, against 8.8 KiB
+   * with one fetch.
+   */
+  private async signatureBatch(
+    repositoryId: string,
+    baseVersionId: string,
+    files: Array<{ path: string; baseSha256: string }>,
+  ): Promise<Uint8Array | null> {
+    const key = JSON.stringify([repositoryId, baseVersionId, files.map((file) => [file.path, file.baseSha256])]);
+    const planned = this.planning ? undefined : this.plannedSignatures.get(key);
+    if (planned) {
+      this.plannedSignatures.delete(key);
+      return planned;
+    }
+    const token = await this.credentials.token();
+    if (!token) return null;
+    const response = await fetch(
+      `${this.credentials.origin()}/v1/repositories/${repositoryId}/objects/delta/signatures`,
+      {
+        method: "POST",
+        headers: {
+          accept: "application/vnd.coderook.delta-signature-batch; version=2",
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "user-agent": "CodeRook/0.1",
+          ...clientHeaders(),
+        },
+        body: JSON.stringify({ baseVersionId, files }),
+        signal: this.controller.signal,
+      },
+    );
+    if (!response.ok) return null;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (this.planning) this.plannedSignatures.set(key, bytes);
+    return bytes;
+  }
+
+  /** A base's bytes from the caller, only when they are exactly the base. */
+  private async localBaseBytes(
+    localBase: UploadRequest["localBase"],
+    filePath: string,
+    base: PriorFile,
+  ): Promise<Uint8Array | null> {
+    if (!localBase || !base.sha256 || base.sourceSize > DELTA_MAX_FILE_BYTES) return null;
+    try {
+      const bytes = await localBase(filePath, base.sha256);
+      if (!bytes || bytes.byteLength > DELTA_MAX_FILE_BYTES) return null;
+      return createHash("sha256").update(bytes).digest("hex") === base.sha256 ? bytes : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private deltaSignature(
+    repositoryId: string,
+    baseVersionId: string,
+    filePath: string,
+    baseSha256: string,
+    version: 1 | 2,
+  ): Promise<Uint8Array> {
+    const key = [repositoryId, baseVersionId, filePath, baseSha256, version].join("\u0000");
+    const known = signatures.get(key);
+    if (known) return known;
+    const asking = this.fetchDeltaSignature(
+      repositoryId,
+      baseVersionId,
+      filePath,
+      baseSha256,
+      version,
+    );
+    signatures.set(key, asking);
+    asking.catch(() => signatures.delete(key));
+    return asking;
+  }
+
+  private async fetchDeltaSignature(
     repositoryId: string,
     baseVersionId: string,
     filePath: string,
@@ -2831,6 +3840,7 @@ export class Uploader {
   private async putBatch(
     repositoryId: string,
     items: Array<{ declaration: Declaration; body: Uint8Array; encoded: Encoded }>,
+    onSent?: (fraction: number) => void,
   ): Promise<Map<string, { objectId: string; size: number }>> {
     const landed = new Map<string, { objectId: string; size: number }>();
     if (!items.length) return landed;
@@ -2883,6 +3893,7 @@ export class Uploader {
       method: "POST",
       contentType: "application/octet-stream",
       body: packed,
+      ...(onSent ? { onSent } : {}),
     });
     for (const one of answer.objects ?? []) {
       landed.set(one.sha256, {
@@ -2905,16 +3916,27 @@ export class Uploader {
     digests: string[],
   ): Promise<Map<string, { objectId: string; size: number }>> {
     const held = new Map<string, { objectId: string; size: number }>();
-    if (!digests.length) return held;
+    /*
+      The plan asked already; what it heard was not held is not asked twice.
+      Asking again cost a whole second request on every save, 34 KB of the
+      first save of 512 files. Only "not held" is reused: sending something
+      that arrived since costs bytes the service then recognises, while an
+      object reported held could have been collected in between, so those
+      are asked again.
+    */
+    const asking = this.planning
+      ? digests
+      : digests.filter((digest) => !this.plannedAbsent.has(digest));
+    if (!asking.length) return held;
     try {
       /*
         Split so one request stays a reasonable size on both ends. Five
         thousand digests is roughly a third of a megabyte of JSON, which is
         nothing beside the transfer it is replacing.
       */
-      for (let at = 0; at < digests.length; at += 5000) {
+      for (let at = 0; at < asking.length; at += 5000) {
         this.check();
-        const batch = [...new Set(digests.slice(at, at + 5000))];
+        const batch = [...new Set(asking.slice(at, at + 5000))];
         const answer = await this.call<{
           stored?: Record<string, { objectId: string; storedSize: number }>;
         }>(`/v1/repositories/${repositoryId}/stored`, {
@@ -2924,6 +3946,9 @@ export class Uploader {
         });
         for (const [digest, one] of Object.entries(answer.stored ?? {})) {
           held.set(digest, { objectId: one.objectId, size: one.storedSize });
+        }
+        if (this.planning) {
+          for (const digest of batch) if (!held.has(digest)) this.plannedAbsent.add(digest);
         }
       }
     } catch {
@@ -2950,6 +3975,7 @@ export class Uploader {
     declaration: Declaration,
     profile: ChunkProfile,
     onOffset: (offset: number) => void,
+    deltaBase?: { baseVersionId: string; baseSha256: string; baseSize: number },
   ): Promise<{
     chunks: Array<{ objectId: string; sourceSize: number; storedSize: number }>;
     reused: number;
@@ -3023,6 +4049,9 @@ export class Uploader {
       at most a maximum chunk each.
     */
     const CHUNK_LANES = 4;
+    const signatures = deltaBase
+      ? await this.chunkDeltaSignatures(repositoryId, declaration.path, deltaBase, layout, held)
+      : new Map<number, { signature: DeltaSignature; start: number; end: number }>();
     /*
       One verdict for this file, shared by its lanes, and consulted only where
       the plan has not already decided. The send takes each chunk's encoding
@@ -3078,16 +4107,24 @@ export class Uploader {
                   "Save again to send what it holds now.",
               );
             }
-            await this.sendChunk(
-              repositoryId,
-              declaration,
-              bytes,
-              piece.digest,
-              chunks,
-              at,
-              note,
-              gzip,
-            );
+            const viaDelta = deltaBase
+              ? await this.putChunkDelta(repositoryId, declaration, deltaBase, bytes, piece.digest, signatures.get(at))
+              : null;
+            if (viaDelta) {
+              note("sent", viaDelta.sentBytes);
+              chunks[at] = { objectId: viaDelta.objectId, sourceSize: piece.length, storedSize: viaDelta.storedSize };
+            } else {
+              await this.sendChunk(
+                repositoryId,
+                declaration,
+                bytes,
+                piece.digest,
+                chunks,
+                at,
+                note,
+                gzip,
+              );
+            }
           }
           done += piece.length;
           onOffset(Math.floor(already + done * share));
@@ -3179,6 +4216,153 @@ export class Uploader {
   }
 
   /** Send one chunk, reusing it if the account already holds those bytes. */
+  /*
+    Chunk deltas (chunk-delta-v1): a changed piece of a large file, sent as a
+    patch against the old pieces covering the same place in the previous
+    version, rather than whole. A 64 KiB edit inside a 768 MiB file changes
+    one piece of about a megabyte, which used to travel complete. The service
+    rebuilds the piece, checks it against its digest and stores it as an
+    ordinary chunk, so nothing stored changes: only what crosses the wire.
+  */
+  private chunkDeltaSupported: boolean | null = null;
+
+  private async chunkDeltaAllowed(): Promise<boolean> {
+    if (this.chunkDeltaSupported !== null) return this.chunkDeltaSupported;
+    this.chunkDeltaSupported = (await this.serviceFeatures()).includes("chunk-delta-v1");
+    return this.chunkDeltaSupported;
+  }
+
+  /**
+   * Receiver signatures for the old bytes behind each changed piece, by the piece's position.
+   * The range is the piece's own place in the file widened by 64 KiB each way, in the base
+   * file's coordinates, so a piece moved a little by an insertion still finds its old bytes.
+   * Empty when the service does not offer chunk deltas or declines; the pieces then go whole.
+   */
+  private async chunkDeltaSignatures(
+    repositoryId: string,
+    path: string,
+    base: { baseVersionId: string; baseSha256: string; baseSize: number },
+    layout: Array<{ offset: number; length: number; digest: string }>,
+    held: Map<string, unknown>,
+  ): Promise<Map<number, { signature: DeltaSignature; start: number; end: number }>> {
+    const found = new Map<number, { signature: DeltaSignature; start: number; end: number }>();
+    if (this.planning || !(await this.chunkDeltaAllowed())) return found;
+    const SLACK = 64 * 1024;
+    const wanted: Array<{ at: number; start: number; end: number }> = [];
+    layout.forEach((piece, at) => {
+      if (held.has(piece.digest)) return;
+      const start = Math.max(0, piece.offset - SLACK);
+      const end = Math.min(base.baseSize, piece.offset + piece.length + SLACK);
+      if (end > start) wanted.push({ at, start, end });
+    });
+    const ask = async (group: typeof wanted): Promise<"ok" | "too-large" | "no"> => {
+      try {
+        const token = await this.credentials.token();
+        if (!token) return "no";
+        const response = await fetch(
+          `${this.credentials.origin()}/v1/repositories/${repositoryId}/objects/chunk-delta/signatures`,
+          {
+            method: "POST",
+            headers: {
+              accept: "application/vnd.coderook.delta-signature-batch; version=2",
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+              "user-agent": "CodeRook/0.1",
+              ...clientHeaders(),
+            },
+            body: JSON.stringify({
+              baseVersionId: base.baseVersionId,
+              path,
+              baseSha256: base.baseSha256,
+              ranges: group.map(({ start, end }) => ({ start, end })),
+            }),
+            signal: this.controller.signal,
+          },
+        );
+        if (response.status === 413) return "too-large";
+        if (!response.ok) return "no";
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        this.chunkDeltaSignatureBytes += bytes.byteLength;
+        const decoded = decodeDeltaSignatureBatch(bytes);
+        if (decoded.length !== group.length) return "no";
+        group.forEach((one, index) => found.set(one.at, { signature: decoded[index]!, start: one.start, end: one.end }));
+        return "ok";
+      } catch {
+        /* Declined or unreachable: those pieces go whole, as they always did. */
+        return "no";
+      }
+    };
+    for (let from = 0; from < wanted.length; from += 64) {
+      const group = wanted.slice(from, from + 64);
+      if ((await ask(group)) !== "too-large") continue;
+      /*
+        One range covered more old pieces than the service will join, and that
+        refused the whole group. Asked for one by one, and a range still too
+        large is asked for once more without its slack: an overwrite that
+        merged old pieces sent 3.1 MB whole for a 64 KiB edit because its
+        slack reached one old piece past the limit.
+      */
+      for (const one of group) {
+        if ((await ask([one])) !== "too-large") continue;
+        const piece = layout[one.at]!;
+        const start = Math.min(piece.offset, base.baseSize);
+        const end = Math.min(base.baseSize, piece.offset + piece.length);
+        if (end > start && (start !== one.start || end !== one.end)) await ask([{ at: one.at, start, end }]);
+      }
+    }
+    return found;
+  }
+
+  /** Signature bytes fetched for chunk deltas during this run, counted in what travelled. */
+  private chunkDeltaSignatureBytes = 0;
+
+  /** One changed piece as a patch; null when there is no signature, the patch would not pay, or the service refuses. */
+  private async putChunkDelta(
+    repositoryId: string,
+    declaration: Declaration,
+    base: { baseVersionId: string; baseSha256: string; baseSize: number },
+    bytes: Buffer,
+    digest: string,
+    signed: { signature: DeltaSignature; start: number; end: number } | undefined,
+  ): Promise<{ objectId: string; storedSize: number; sentBytes: number } | null> {
+    if (!signed || this.planning) return null;
+    try {
+      const raw = createDeltaPatch(bytes, signed.signature);
+      /* A patch that is mostly new bytes of one kind compresses well; sent packed only when it clearly saves. */
+      const packed = raw.byteLength > 1024 ? new Uint8Array(gzipSync(raw, { level: 6 })) : null;
+      const usePacked = packed !== null && packed.byteLength < raw.byteLength * 0.9;
+      const patch = usePacked ? packed : raw;
+      const manifest = new TextEncoder().encode(
+        JSON.stringify({
+          baseVersionId: base.baseVersionId,
+          path: declaration.path,
+          baseSha256: base.baseSha256,
+          start: signed.start,
+          end: signed.end,
+          sha256: digest,
+          size: bytes.byteLength,
+          mediaType: declaration.mediaType,
+          patchEncoding: usePacked ? "gzip" : "identity",
+        }),
+      );
+      const body = new Uint8Array(4 + manifest.byteLength + patch.byteLength);
+      new DataView(body.buffer).setUint32(0, manifest.byteLength, false);
+      body.set(manifest, 4);
+      body.set(patch, 4 + manifest.byteLength);
+      /* Worth it only when clearly smaller than the piece itself, the same margin the file deltas use. */
+      if (body.byteLength >= bytes.byteLength * 0.8) return null;
+      const answer = await this.call<{ objectId: string; storedSize: number }>(
+        `/v1/repositories/${repositoryId}/objects/chunk-delta`,
+        { method: "POST", contentType: "application/octet-stream", body },
+      );
+      if (!answer?.objectId) return null;
+      counted("chunks sent as deltas", 1);
+      return { objectId: answer.objectId, storedSize: answer.storedSize, sentBytes: body.byteLength };
+    } catch {
+      return null;
+    }
+  }
+
   private async sendChunk(
     repositoryId: string,
     declaration: Declaration,
@@ -3375,6 +4559,22 @@ export class Uploader {
     return this.deltaProtocol;
   }
 
+  /**
+   * Whether a save may name only what changed (`filesFrom`).
+   *
+   * Asked, never assumed, and for a stronger reason than the others: a
+   * service that does not know the field would drop it and publish the
+   * changed files alone as the whole project. Only a service that lists
+   * `version-delta-v1` gets anything but the full list.
+   */
+  private async versionDeltaAllowed(): Promise<boolean> {
+    if (this.versionDeltaSupported !== null) return this.versionDeltaSupported;
+    this.versionDeltaSupported = (await this.serviceFeatures()).includes(
+      "version-delta-v1",
+    );
+    return this.versionDeltaSupported;
+  }
+
   private async deltaBatchAllowed(): Promise<boolean> {
     if (this.deltaBatchSupported !== null) return this.deltaBatchSupported;
     this.deltaBatchSupported = (await this.serviceFeatures()).includes(
@@ -3536,4 +4736,105 @@ async function executableFor(
   } catch {
     return before;
   }
+}
+
+/*
+  The folder's cache of version listings: `.coderook/versions/<id>.json`.
+
+  `.coderook` is never uploaded and ignores itself, so this never reaches a
+  project. A version never changes, so an entry is either right or for a
+  different version; it is checked against both names it was written under,
+  and anything unreadable is simply not used.
+*/
+async function readListing(
+  localPath: string,
+  repositoryId: string,
+  versionId: string,
+): Promise<Array<Record<string, unknown>> | null> {
+  try {
+    const kept = JSON.parse(
+      await readFile(path.join(localPath, ".coderook", "versions", `${versionId}.json`), "utf8"),
+    ) as { repositoryId?: unknown; versionId?: unknown; files?: unknown };
+    if (
+      kept.repositoryId !== repositoryId ||
+      kept.versionId !== versionId ||
+      !Array.isArray(kept.files)
+    ) {
+      return null;
+    }
+    return kept.files as Array<Record<string, unknown>>;
+  } catch {
+    return null;
+  }
+}
+
+async function writeListing(
+  localPath: string,
+  repositoryId: string,
+  versionId: string,
+  files: Array<Record<string, unknown>>,
+): Promise<void> {
+  const folder = path.join(localPath, ".coderook", "versions");
+  try {
+    await mkdir(folder, { recursive: true });
+    await writeFile(
+      path.join(folder, `${versionId}.json`),
+      JSON.stringify({ repositoryId, versionId, files }),
+    );
+    /* Only the newest few: the next save needs one, a retry another. */
+    const entries = await Promise.all(
+      (await readdir(folder))
+        .filter((name) => name.endsWith(".json"))
+        .map(async (name) => ({
+          name,
+          at: (await stat(path.join(folder, name))).mtimeMs,
+        })),
+    );
+    entries.sort((left, right) => right.at - left.at);
+    for (const old of entries.slice(KEPT_LISTINGS)) {
+      await rm(path.join(folder, old.name), { force: true });
+    }
+  } catch {
+    /* A cache that cannot be written costs one download next time, nothing more. */
+  }
+}
+
+/** A file the previous version holds, in the shape a save names it. */
+function wireFromPrior(filePath: string, held: PriorFile) {
+  return {
+    path: filePath,
+    ...(held.pack
+      ? {
+          pack: {
+            objectId: held.pack.objectId,
+            offset: held.pack.offset,
+            length: held.pack.length,
+          },
+          sha256: held.sha256,
+        }
+      : held.chunks?.length
+        ? { chunks: held.chunks, sha256: held.sha256 }
+        : { objectId: held.objectId }),
+    sourceSize: held.sourceSize,
+    storedSize: held.storedSize,
+    mediaType: held.mediaType,
+    executable: held.executable === true,
+  };
+}
+
+/** Whether two entries name the same file stored the same way. */
+function sameEntry(left: object, right: object): boolean {
+  return canonical(left) === canonical(right);
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }

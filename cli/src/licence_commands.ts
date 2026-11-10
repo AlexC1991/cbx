@@ -28,12 +28,8 @@ import { IGNORE_TEMPLATES } from "../../cbx/src/core/ignore_templates.js";
 import { readRules, writeRules } from "../../cbx/src/core/worktree.js";
 import { whoami } from "./api.js";
 import type { Parsed } from "./registry.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
 
 const SHAPES: Record<LicenceShape, string> = {
   permissive: "Do what you like, keep the notice",

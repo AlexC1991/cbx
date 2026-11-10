@@ -91,7 +91,13 @@ export const CREDENTIAL_PATTERNS: CredentialPattern[] = [
   {
     id: "slack-token",
     name: "a Slack token",
-    match: /\bxox[baprs]-[0-9A-Za-z-]{10,}/g,
+    /*
+      Slack's tokens open with a number group: xoxb-1234…-5678…-AbC…. The
+      loose form also took "xoxb-test-bot-token", which is how test suites
+      spell a fake one — an open-source project's integration tests were
+      refused six times over for them.
+    */
+    match: /\bxox[baprs]-\d+-[0-9A-Za-z-]{10,}/g,
   },
   {
     id: "stripe-live-key",

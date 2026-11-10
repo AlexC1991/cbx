@@ -70,6 +70,7 @@ cannot drift apart unnoticed.
 | Folder | What it is |
 | --- | --- |
 | [`cbx/`](cbx) | The engine: storage, chunking, the local history, merging, push and pull. Node's standard library only. |
+| [`cbx/engine/`](cbx/engine) | The native byte engine (Rust): the same objects, faster, and the native `cbx` described below. |
 | [`cli/`](cli) | The `cbx` command line, published as `@coderook/cli`. |
 
 ## Build and test
@@ -80,6 +81,39 @@ Node 22.15 or later (it uses `zlib`'s zstd, added in 22.15 and 23.8).
 cd cbx && npm ci && npm test
 cd ../cli && npm ci && npm test
 ```
+
+## A native `cbx`
+
+Installed from npm, every `cbx` starts Node first: npm's launchers always do.
+Built from this repository, the engine can be the `cbx` command itself. It
+answers `cbx status` on its own when the history lets it (no Node at all) and
+hands every other command to the command line.
+
+```bash
+cd cbx && npm ci && npm run build
+cd ../cli && npm ci && npm run build
+cd ../cbx/engine && cargo build --release
+# Put the engine at the top of this checkout under the name cbx, and that folder on your PATH:
+cp target/release/cbx-engine ../../cbx        # Windows: copy target\release\cbx-engine.exe ..\..\cbx.exe
+```
+
+Next to it, `cli/dist/cli/src/bin.js` is found on its own; elsewhere, set
+`CBX_CLI` to that file (and `CBX_NODE` if Node is not on the PATH). The status
+it answers is the one the full command line prints, byte for byte, and it
+answers only where it can vouch for that: see
+[cbx/engine/README.md](cbx/engine/README.md#as-the-cbx-command). On an
+8,525-file folder a quiet status took 47 ms this way, against 57–68 ms for
+`git status`, and 47 ms with a file edited, against 57–70 ms.
+
+### The cbx-local 2 history (preview)
+
+`CBX_LOCAL_FORMAT=2 cbx init` makes a history that keeps the same objects
+and save ids in solid blocks and deltas: over 20 saves of three real folders
+it came to 13–14% less than Git after `git gc --aggressive` on two of them
+and 5% less on the third. It is a preview, and is not the default yet. An
+older cbx refuses such a history and asks to be updated. The design is in
+[cbx/engine/V2-STORE.md](cbx/engine/V2-STORE.md). The native status above
+answers only in these histories.
 
 ## Licence
 

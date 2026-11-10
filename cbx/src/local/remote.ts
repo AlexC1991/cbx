@@ -279,7 +279,21 @@ export async function push(
 
         await rm(scratch, { recursive: true, force: true });
         await writeEntriesInto(repository, scratch, changed.map((file) => after.get(file)!));
+        /*
+          This history holds the base of every file it changes, as Git's sender
+          does, so changed files go up as exact patches with no signatures
+          fetched first.
+        */
+        const baseTree = before;
         const request: UploadRequest = {
+          /* The listing of each version pushed is kept in the history, for the next push. */
+          listingRoot: repository.directory,
+          localBase: async (file, sha256) => {
+            const entry = baseTree.get(file);
+            if (!entry || entry.sha256 !== sha256) return null;
+            const parts = await Promise.all(entry.chunks.map((name) => repository.objects.get(name)));
+            return new Uint8Array(Buffer.concat(parts));
+          },
           localPath: scratch,
           include: [...changed, ...changes.deleted],
           deletions: changes.deleted,

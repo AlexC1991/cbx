@@ -15,8 +15,16 @@
  */
 import { createServer } from "node:http";
 
+import { apiOrigin, assertSafeTarget } from "./live.mjs";
+
+/*
+  Forwards to the service the run is pointed at (CODEROOK_API_URL, e.g. the
+  local test bench), and refuses production unless asked for it explicitly,
+  like the suites that use it.
+*/
+assertSafeTarget();
 const port = Number(process.argv[2] ?? 8787);
-const UPSTREAM = "https://api.coderook.com";
+const UPSTREAM = apiOrigin();
 
 /** Requests matching this are answered by hanging up, once each. */
 const dropOnce = new Set(["POST /v1/repositories/"]);

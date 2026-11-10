@@ -10,16 +10,16 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
-import { assertSafeTarget, autoClean, scratchRoot, versionFilePayload } from "./live.mjs";
+import { apiOrigin, assertSafeTarget, autoClean, liveToken, scratchRoot, versionFilePayload } from "./live.mjs";
 import { linkIn } from "./links.mjs";
 
 assertSafeTarget();
 const root = path.resolve(scratchRoot("suite-get"));
 mkdirSync(root, { recursive: true });
-const token = readFileSync(
-  path.join(process.env.APPDATA, "CodeRook", "token"), "utf8").trim();
+/* The token the run is handed (CODEROOK_TOKEN) first, like every other suite. */
+const token = liveToken();
 const entry = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");
-const API = "https://api.coderook.com";
+const API = apiOrigin();
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
 function rook(cwd, home, args) {

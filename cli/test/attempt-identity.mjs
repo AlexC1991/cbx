@@ -11,16 +11,17 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 
-import { assertSafeTarget, autoClean, scratchRoot } from "./live.mjs";
+import { apiOrigin, assertSafeTarget, autoClean, liveToken, scratchRoot } from "./live.mjs";
 import { linkFile, linkIn } from "./links.mjs";
 
 assertSafeTarget();
 const run = promisify(execFile);
 const root = path.resolve(scratchRoot("suite-attempt"));
 mkdirSync(root, { recursive: true });
-const API = "https://api.coderook.com";
-const token = readFileSync(
-  path.join(process.env.APPDATA, "CodeRook", "token"), "utf8").trim();
+/* The service the run is pointed at (CODEROOK_API_URL), not production by default of this file. */
+const API = apiOrigin();
+/* The token the run is handed (CODEROOK_TOKEN) first, like every other suite. */
+const token = liveToken();
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 const entry = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");
 

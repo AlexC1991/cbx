@@ -1,6 +1,6 @@
 ---
 name: coderook
-description: Save, browse and restore versions of a project on CodeRook — a version host where every version is a complete snapshot, reached with the cbx command or with plain git. Use when asked to save, submit or push work to CodeRook, check what has changed, look at a project's versions or files, fetch a project, start or switch a line of work, or resolve a save that landed at the same time as somebody else's.
+description: Save, browse and restore versions of a project on CodeRook — a version host where every version is a complete snapshot, reached with the cbx command or with plain git. Use when asked to save, submit or push work to CodeRook, check what has changed, look at a project's versions or files, fetch a project, start or switch a line of work, resolve a save that landed at the same time as somebody else's, build a project's executables for Windows, Linux and macOS from one machine (cbx build), or publish a mod to a game's mod repository or set one up (cbx mods). Also inspect shared workspace credits and separate PR allowances.
 allowed-tools: Bash Read
 ---
 
@@ -18,6 +18,30 @@ git itself through CodeRook's remote helper. Run them with Bash.
 in it), prefer git — see *Working in a git repository* below. Each commit then
 arrives with its own message, instead of one snapshot standing in for many.
 Use `cbx submit` for folders that are not git repositories.
+
+## Remote work without a full checkout
+
+Use `cbx workspace` when the person wants to continue a CodeRook project from a lightweight laptop. Do not clone the full project unless that work needs local files. Start with `cbx workspace list <project>` or open a named draft with a unique `--key`. Keep its ID and revision, read/search the needed paths, edit with explicit hashes in a JSON `--data-file`, review the diff, then save the authorised revision. Retry a lost response using the same operation key and arguments. Saving and deploying are different actions.
+
+`cbx workspace show <project> <id>` includes the administrator-configured recipe commands and target information. Run a named recipe, inspect its job with `logs`, and use `cancel` if needed. Only deploy an explicitly requested target and a saved version with applicable checks. A missing recipe requires configuration; running a local terminal command does not change remote files.
+
+To hand a draft to a machine that is not signed in as the owner, run `cbx workspace assign <project> <draft> --name "Laptop"`. It prints a token that reaches that one draft (read the project, edit, save and run its checks; no deploys, settings, other drafts or more tokens). Tell the person to give it to the other machine privately; never repeat the token yourself. On that machine: `cbx sign-in` (paste the token), `cbx workspace checkout <project> <draft> [folder]`, edit the files, then `cbx workspace push` (add `--save -m "…"` to save, `--dry-run` to preview). A checked-out folder is not a linked folder, so `cbx submit` does not apply there. A handed-over machine's saves never land on the draft's line directly: they go to the draft's own line `drafts/<name>-<id>` and open a pull request into it, which the owner or a reviewer approves and merges (see it with `cbx pr list`). Saves made signed in as the owner go straight to the line. `cbx workspace assignments` lists live tokens and `cbx workspace unassign` ends one; archiving the draft ends them all.
+
+`cbx machines [project]` shows the PCs working on a project: linked folders and handed-over drafts, the version each holds, how far behind the line it is and its unsaved file count, then the runners. A machine appears when cbx status, get, submit or a workspace command runs there; `CODEROOK_NO_PRESENCE=1` keeps one off the list. Check it before assuming nobody else is mid-change.
+
+`cbx mcp --workspaces` opts into the remote workspace tools using this account's stored token. The original `cbx mcp` stays read-only. A token needs explicit workspace edit/run/deploy grants for those actions; never print its value. The remote plugin can connect directly without this CLI.
+
+Native jobs require CLI 0.38.0 or later on the selected Windows laptop and a matching `cbx runner --name` and label. The named recipe can select `includePaths` so only needed inputs download to a temporary job folder. Hosted jobs continue with the desktop PC off. Native execution, local GPU features, toolchains and signed-in services need their own suitable machine/setup. Remote task notes share project handover state, not proprietary chat history.
+
+## Usage and limits
+
+Use `cbx workspace usage <project>` (no draft ID needed), or the remote MCP `workspace_usage` tool, to read the repository payer's current workspace and PR usage. These balances are shared across that payer's repositories, not a separate grant for each project. Report included, spent, reserved and available purchased workspace credits separately, along with the PR allowance and resetsAt. Use returned amounts; do not infer a balance from a plan name. A reservation is held for a running job, not another charge, and remainingCredits already excludes included reservations. Reading usage does not purchase credits or enable alerts.
+
+Paid accounts normally receive separate workspace and PR allowances of 20% of normalized monthly base-plan revenue, excluding storage add-ons; returned values also reflect any explicit PR override. Verified free accounts have a small workspace allowance; inspect freeVerified instead of promising it to an unverified account. Hosted execution consumes included workspace allowance first, then purchased workspace credits. AI PR reviews and requested changes use their separate PR allowance; hosted PR checks use the workspace pool once. Workspace top-ups do not refill PR allowance. Ordinary remote file reads/edits and own-machine runners do not consume hosted runtime credits. A positive displayed balance does not guarantee a job can start: funding, reservations, concurrency and execution permissions still apply.
+
+When a job is queued, inspect `cbx workspace logs <project> <draft> <run>` or remote `workspace_run_status` and its summary. If it is waiting for credits, explain the wait and the returned reset date; retain the run ID instead of repeatedly queuing replacements or polling in a tight loop. The runner reserves a funded lifecycle before starting and can stop at that deadline; unused funds are released after confirmed teardown. Included allowances reset on the first of each UTC month; purchased credits carry over. When PR allowance is exhausted, AI reviews/changes pause while manual PR work continues.
+
+Purchases and recurring/notification settings stay in CodeRook Subscription; an authorized owner can also use the repository Settings top-up popup without leaving the repo. A minimum US$1 top-up funds 750 workspace credits (75% of the retail amount; 1,000 credits represent US$1 of metered usage). Automatic refills require the owner's explicit setup and consent, begin only after included spend is exhausted, and obey the owner's monthly cap. These tools cannot purchase credits, change payment settings or promise an automatic refill. If usage access is refused for a collaborator or a draft-scoped token, explain the restriction and ask the billing owner to inspect it on the site; do not broaden token permissions.
 
 ## Before anything else
 
@@ -246,11 +270,13 @@ line's source to find these — this is the whole of it:
 GET /projects?q=                                  public projects, newest first
 GET /projects/{owner}/{slug}                      one project
 GET /projects/{owner}/{slug}/versions             the versions it offers
+GET /projects/{owner}/{slug}/releases             every release, with its downloads
 GET /projects/{owner}/{slug}/releases/latest      newest release and its files
 GET /projects/{owner}/{slug}/updates/latest.yml   electron-updater feed
 GET /projects/{owner}/{slug}/versions/{v}/files         every file, with digests
 GET /projects/{owner}/{slug}/versions/{v}/file?path=    one file
 GET /projects/{owner}/{slug}/versions/{v}/archive       the version as a zip
+GET /projects/{owner}/{slug}/versions/{v}/last-changes?path=   which version last changed each entry
 GET /projects/{owner}/{slug}/versions/{v}/attachments   files attached to it
 GET /projects/{owner}/{slug}/versions/{v}/attachments/{id}   download one
 ```
@@ -279,8 +305,16 @@ The feed serves `latest.yml`, `latest-mac.yml` and `latest-linux.yml` with
 each file's size and SHA-512, and redirects file names to their downloads.
 Anything else can read `releases/latest` as JSON: version, notes, and every
 file with its size, SHA-256 and `url`. Updaters have no account, so the
-project they read must be public; keep private code in a separate project and
-ship releases from a public one.
+project they read must be public, but its source need not be:
+
+```bash
+cbx release 1.4.0 --downloads public   # notes, attachments and feed public; files stay private
+cbx releases                           # public / downloads public / private, and the addresses
+```
+
+**Ask before `--downloads public`**: it publishes the attached files to anyone.
+One project holds the code and ships the app; a second "releases" project is
+no longer needed.
 
 ## Building executables for every platform
 
@@ -295,6 +329,88 @@ It builds on this machine, with the tools it has, and uploads nothing. Run
 unasked. `--ship` attaches the results to the newest save, so **ask before
 `--ship`**, as before any save. A project's own build description lives in
 `coderook.build.json`.
+
+## Pull requests
+
+A pull request is a proposal: a line offered to another line (`cbx propose`
+opens one). Read and review them with `cbx pr`:
+
+```bash
+cbx pr list                         # what is open on this project
+cbx pr view M-3                     # reviews, checks, conversation, what blocks merging
+cbx pr files M-3                    # what it changes
+cbx pr comment M-3 --line src/app.ts:42 -m "…"
+cbx pr approve M-3                  # or request-changes M-3 -m "…"
+cbx pr merge M-3
+```
+
+**Ask before** `approve`, `request-changes`, `merge`, `close` and any comment:
+each is the person speaking or acting, and is seen by others. An approval
+stops counting when new saves land on the line, so re-check after pushing.
+Every pull request carries a `coderook/malware` check: what the line adds or
+changes is scanned before it can land, and a failure names the file. Do not
+try to get round it.
+
+## Private files
+
+`cbx private add "design/"` keeps matching files out of everything outside the
+project (listings, zips, clone, Pages). Ask before changing the list: it
+decides what strangers can see.
+
+## Runs
+
+`cbx runs`, `cbx logs 12 --follow` to watch one, `cbx cancel 12` to stop one,
+`cbx rerun 12` to run it again, `cbx approve 14` for one waiting for approval
+(ask before each). Workflows can be YAML files in `.rook/workflows`; check
+them with `cbx actions check` before saving. Never print or echo secrets:
+`cbx secret set NAME` asks for the value itself, so let the person type it.
+
+Runs receive `CODEROOK_API` and `CODEROOK_PROJECT`. Only jobs allowed to act on
+the project receive a temporary `CODEROOK_TOKEN`; credential-free workspace
+checks and artifact builds do not. Project secrets require approval of the
+saved source and exact execution settings, and never reach PR checks.
+Credential-capable jobs cannot keep artifacts; build them in a separate
+credential-free job and publish the approved artifact in the release job.
+Native runners must use CLI 0.41.1 or newer for chunk-safe masking and isolated
+HOME/npm settings. They remain trusted machines, not a filesystem/network sandbox.
+
+## Issues, forks and security
+
+`cbx issue view|comment|close|label|assign`, `cbx fork`, `cbx security`. Ask
+before closing, labelling, assigning, forking, or sending anything: each is the
+person acting where others see it. A security report is private to the
+project's owner; never put vulnerability details in a public issue.
+
+## Releases
+
+`cbx release v2.0 --draft --generate-notes` then `cbx release publish`;
+`cbx verify owner/project v2.0 ./file` checks a download; `cbx deps` lists
+known vulnerabilities in the lockfiles. Ask before publishing.
+
+## Mod repositories for games
+
+A game's maker can run a mod repository: players' game clients read a signed
+catalogue from it, modders publish to it, and nothing is listed until it
+passes the repository's rules and a malware scan.
+
+```bash
+cbx mods info zt1                                   # a repository's rules, for anybody
+cbx mods publish ./BetterTrees --repo zt1           # zip, upload, wait for the checks
+cbx mods publish ./HD-Art --repo zt1 --part animals # one part of a bigger mod
+cbx mods list zt1                                   # your mods and how their checks went
+cbx mods create my-game --name "My Game" --allow .png,.ogg,.json
+```
+
+`publish` reads the folder's `mod.json` (or the repository's manifest) for the
+mod's id, name, folder and version; `--id`, `--name`, `--folder` and
+`--version` override it. It waits up to 30 minutes for the checks and prints
+what failed, file by file — pass that on as it is. Programs and scripts
+(`.exe`, `.dll`, `.ps1`, `.js` …) are refused in every repository, so do not
+try to rename one past the check. **Ask before `publish`**, as before any
+save: it makes the mod public once it passes. Ask before `remove`, `block`
+and `delete`, which only the person should decide. The game-side protocol
+(signed requests, the catalogue signature, downloads) is at
+https://coderook.com/docs#mod-repositories.
 
 ## Things not to do
 

@@ -76,6 +76,8 @@ const CREDENTIALS: Array<[string, string]> = [
  * these appears in ordinary projects constantly.
  */
 const LOOKALIKES: Array<[string, string]> = [
+  /* From an open-source project's integration tests, refused six times over. */
+  ["a test suite's fake slack token", 'botToken: "xoxb-test-bot-token-for-slack",'],
   ["a git commit sha", "const base = '9bb7986a2f448b9f786a7891c50fc5b8e95a3161';"],
   ["a short sha", "See commit 2f448b9 for the fix."],
   ["a uuid", 'id: "cdc24e1c-b4c1-44e2-b9af-46b5f47f4702"'],

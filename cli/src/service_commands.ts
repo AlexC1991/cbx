@@ -7,10 +7,12 @@
  * answered by looking at what is on the machine.
  */
 
+import { commandCheckWorkflows, commandSetWorkflow } from "./actions_command.js";
 import process from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import {
+  acceptInvite,
   addWebhook,
   changeWorkflow,
   collaborators,
@@ -20,26 +22,38 @@ import {
   issues,
   markRelease,
   releases,
+  setReleaseDownloadsPublic,
+  whoami,
   versions,
   revokeToken,
+  callApi,
+  cancelRun,
+  rerunRun,
   runLogs,
   runs,
   setWatch,
   tokens,
   watch,
   removeWebhook,
+  removeCollaborator,
+  revokeInvite,
+  redeliverWebhook,
+  setCollaboratorRole,
+  testWebhook,
+  updateWebhook,
+  webhookDeliveries,
   webhooks,
   workflows,
+  type Webhook,
+  type WebhookDelivery,
   type WatchSettings,
 } from "./api.js";
+import { credentials, readLink } from "./config.js";
 import { resolveProject } from "./project_commands.js";
+import { Tracks } from "../../cbx/src/core/tracks.js";
 import type { Parsed } from "./registry.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
 
 function bytes(value: number): string {
   if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
@@ -137,13 +151,50 @@ export async function commandIssues(parsed: Parsed): Promise<number> {
  * would be a feature that exists twice and agrees by luck.
  */
 export async function commandRelease(parsed: Parsed): Promise<number> {
-  const name = parsed.positional[0];
-  if (!name) {
+  /*
+    `--downloads public|private` decides who can take what is attached,
+    apart from the source. Given without a name it changes an existing
+    release and nothing else: naming it again would rewrite its notes.
+  */
+  const downloads = parsed.flags.get("downloads");
+  if (downloads !== undefined && downloads !== "public" && downloads !== "private") {
+    console.error(red("--downloads is public or private: cbx release v1.0 --downloads public"));
+    return 1;
+  }
+  /* `cbx release publish` publishes a draft (backend release_extras.ts). */
+  const publishing = parsed.positional[0] === "publish";
+  const name = publishing ? undefined : parsed.positional[0];
+  if (!name && downloads === undefined && !publishing) {
     console.error(red("Name the release: cbx release v1.0"));
     return 1;
   }
-  const project = await resolveProject(parsed.positional[1]);
+  const project = await resolveProject(name || publishing ? parsed.positional[1] : parsed.positional[0]);
   if (!project) return 1;
+  if (publishing) {
+    const listing = await callApi<{ drafts?: Array<{ versionId: string; sequence: number; name: string }> }>(
+      `/v1/repositories/${encodeURIComponent(project.id)}/releases`,
+    );
+    const drafts = listing.drafts ?? [];
+    const asked = parsed.flags.get("version");
+    const draft =
+      typeof asked === "string"
+        ? drafts.find((one) => String(one.sequence) === asked.replace(/^v/i, ""))
+        : drafts.length === 1
+          ? drafts[0]
+          : undefined;
+    if (!draft) {
+      console.error(
+        red(drafts.length ? `Which draft? ${drafts.map((one) => `${one.name} (--version ${one.sequence})`).join(", ")}` : "This project has no draft releases."),
+      );
+      return 1;
+    }
+    const published = await callApi<{ name: string; sequence: number }>(
+      `/v1/repositories/${encodeURIComponent(project.id)}/versions/${encodeURIComponent(draft.versionId)}/release-draft/publish`,
+      { method: "POST" },
+    );
+    console.log(`${green("Published")} ${bold(published.name)} ${dim("at")} v${published.sequence}`);
+    return 0;
+  }
 
   const all = await versions(project.id);
   if (!all.length) {
@@ -152,37 +203,97 @@ export async function commandRelease(parsed: Parsed): Promise<number> {
   }
 
   /*
-    The newest version unless one is named. A release usually means "what I
-    have just finished", and asking for the number every time would make the
-    common case the awkward one.
+    The head of the line unless a version is named: a release usually means
+    "what I have just finished", and asking for the number every time would
+    make the common case the awkward one.
+
+    The head, not the newest number. They differ after `cbx undo`: the line
+    goes back to v2 and v3 stays in the history, passed over. Taking the
+    newest released exactly the save that was just undone. The line is this
+    folder's own when it is linked to this project, otherwise the project's
+    default; the newest number is only the answer for a project with no lines.
   */
   const wanted = parsed.flags.get("version");
-  const target =
-    typeof wanted === "string"
-      ? all.find((version) => String(version.sequence) === wanted.replace(/^v/i, ""))
-      /* The newest by number rather than by position in the list. */
-      : all.reduce((newest, one) => (one.sequence > newest.sequence ? one : newest));
+  let target;
+  if (typeof wanted === "string") {
+    target = all.find((version) => String(version.sequence) === wanted.replace(/^v/i, ""));
+  } else {
+    const link = await readLink(process.cwd());
+    const lineName = (link?.repositoryId === project.id ? link.track : undefined) ?? project.defaultBranch ?? "main";
+    const line = (await new Tracks(credentials).list(project.id)).find(
+      (candidate) => candidate.kind === "line" && candidate.name === lineName,
+    );
+    target =
+      (line?.headVersionId && all.find((version) => version.id === line.headVersionId)) ||
+      all.reduce((newest, one) => (one.sequence > newest.sequence ? one : newest));
+  }
   if (!target) {
     console.error(red(`This project has no version ${String(wanted)}.`));
     return 1;
   }
 
-  const notes = parsed.flags.get("notes");
-  try {
-    await markRelease(
-      project.id,
-      target.id,
-      name,
-      typeof notes === "string" ? notes : null,
+  let notes = parsed.flags.get("notes");
+  /* Notes written from what changed since the last release (release_extras.ts). */
+  if (parsed.flags.has("generate-notes")) {
+    const written = await callApi<{ notes: string }>(
+      `/v1/repositories/${encodeURIComponent(project.id)}/versions/${encodeURIComponent(target.id)}/release-notes`,
     );
-  } catch (error) {
-    console.error(red(error instanceof Error ? error.message : String(error)));
-    return 1;
+    notes = typeof notes === "string" ? `${notes}\n\n${written.notes}` : written.notes;
   }
-  console.log(
-    `${green("Released")} ${bold(name)} ${dim("at")} v${target.sequence}` +
-      `${dim(" — ")}${target.message.split("\n")[0]!.slice(0, 48)}`,
-  );
+  const channelFlag = parsed.flags.get("channel");
+  const options = {
+    ...(parsed.flags.has("prerelease") ? { prerelease: true } : {}),
+    ...(typeof channelFlag === "string" ? { channel: channelFlag } : {}),
+  };
+  if (name && parsed.flags.has("draft")) {
+    await callApi(`/v1/repositories/${encodeURIComponent(project.id)}/versions/${encodeURIComponent(target.id)}/release-draft`, {
+      method: "PUT",
+      body: { name, notes: typeof notes === "string" ? notes : null, ...options },
+    });
+    console.log(`${green("Drafted")} ${bold(name)} ${dim("at")} v${target.sequence}${dim(" — nothing is public yet.")}`);
+    console.log(dim(`  Attach builds with cbx attach, then: cbx release publish --version ${target.sequence}`));
+    return 0;
+  }
+  if (name) {
+    try {
+      await markRelease(
+        project.id,
+        target.id,
+        name,
+        typeof notes === "string" ? notes : null,
+        options,
+      );
+    } catch (error) {
+      console.error(red(error instanceof Error ? error.message : String(error)));
+      return 1;
+    }
+    console.log(
+      `${green("Released")} ${bold(name)} ${dim("at")} v${target.sequence}` +
+        `${dim(" — ")}${target.message.split("\n")[0]!.slice(0, 48)}`,
+    );
+  }
+  if (downloads !== undefined) {
+    try {
+      await setReleaseDownloadsPublic(project.id, target.id, downloads === "public");
+    } catch (error) {
+      console.error(red(error instanceof Error ? error.message : String(error)));
+      return 1;
+    }
+    console.log(
+      downloads === "public"
+        ? `${green("Downloads public")} ${dim("on")} v${target.sequence}${dim(
+            ": anybody can take what is attached; the source keeps its own visibility.",
+          )}`
+        : `${green("Downloads private")} ${dim("on")} v${target.sequence}${dim(
+            ": only people on this project can take them now.",
+          )}`,
+    );
+    if (downloads === "public" && project.visibility !== "public") {
+      console.log(
+        dim("  The project itself is not public, so nobody outside it can reach them yet: cbx visibility public."),
+      );
+    }
+  }
   return 0;
 }
 
@@ -200,21 +311,116 @@ export async function commandReleases(parsed: Parsed): Promise<number> {
     const when = release.releasedAt
       ? new Date(release.releasedAt).toLocaleDateString()
       : "";
+    const who = release.sourcePublic
+      ? "public"
+      : release.downloadsPublic
+        ? "downloads public"
+        : "private";
     console.log(
       `  ${accent(`v${release.sequence}`).padEnd(16)} ` +
         `${(release.name || "—").padEnd(28)} ${when.padEnd(14)} ` +
-        `${release.assets.length} files`,
+        `${`${release.assets.length + release.attachments.length} files`.padEnd(10)} ${dim(who)}`,
     );
     const firstLine = release.notes.split("\n")[0];
     if (firstLine) console.log(`    ${dim(firstLine)}`);
+  }
+  /* Where an app or a script reads them, for a project anybody can reach. */
+  const owner =
+    project.visibility === "public" && published.some((one) => one.downloadsPublic || one.sourcePublic)
+      ? await whoami().then((me) => me.username).catch(() => null)
+      : null;
+  if (owner) {
+    const base = `https://api.coderook.com/v1/public/projects/${encodeURIComponent(owner)}/${encodeURIComponent(project.slug)}`;
+    console.log("");
+    console.log(dim("  From code, no account needed:"));
+    console.log(`  ${dim("latest release")}  ${base}/releases/latest`);
+    console.log(`  ${dim("all releases")}    ${base}/releases`);
+    console.log(`  ${dim("update feed")}     ${base}/updates`);
   }
   return 0;
 }
 
 /** Who can reach a project, and who has been asked. */
 export async function commandCollaborators(parsed: Parsed): Promise<number> {
+  /*
+    Accepting comes first: whoever is joining has no project of theirs to
+    name yet. The link is the one from the email, or the one the sender was
+    shown; only the token in it matters.
+  */
+  const link = parsed.flags.get("accept");
+  if (link === true) {
+    console.error(red("Which invite? Try: cbx people --accept <link from the invite>"));
+    return 1;
+  }
+  if (typeof link === "string" && link.trim()) {
+    let token = link.trim();
+    try {
+      token = new URL(token).searchParams.get("invite") ?? token;
+    } catch {
+      /* Not a link: taken as the token itself. */
+    }
+    const joined = await acceptInvite(token);
+    console.log(green(`You've joined the project as ${joined.role}.`));
+    console.log(dim("  Fetch it with cbx clone <project>; cbx projects lists what you can reach."));
+    return 0;
+  }
+
   const project = await resolveProject(parsed.positional[0]);
   if (!project) return 1;
+
+  /*
+    Changing a role, taking somebody off, and withdrawing an invite: the rest
+    of the website's Collaborators screen. Each names the person by email or
+    display name, which is what the listing below shows.
+  */
+  const changing = parsed.flags.get("change");
+  const removing = parsed.flags.get("remove");
+  const cancelling = parsed.flags.get("cancel-invite");
+  if (changing !== undefined || removing !== undefined || cancelling !== undefined) {
+    const wanted = changing ?? removing ?? cancelling;
+    if (typeof wanted !== "string" || !wanted.trim()) {
+      console.error(red("Who? Name them by email address or display name."));
+      return 1;
+    }
+    const who = wanted.trim().toLowerCase();
+    const people = await collaborators(project.id);
+    if (cancelling !== undefined) {
+      const pending = people.invites.find((one) => one.email.toLowerCase() === who || one.id === wanted.trim());
+      if (!pending) {
+        console.error(red(`No invite waiting for ${wanted.trim()} on ${project.name}.`));
+        return 1;
+      }
+      await revokeInvite(project.id, pending.id);
+      console.log(green(`Withdrew the invite to ${pending.email}. Its link no longer works.`));
+      return 0;
+    }
+    const person = people.collaborators.find(
+      (one) =>
+        one.email.toLowerCase() === who ||
+        one.displayName.toLowerCase() === who ||
+        one.userId === wanted.trim(),
+    );
+    if (!person) {
+      console.error(red(`${wanted.trim()} is not one of ${project.name}'s people.`));
+      console.error(dim(`  See who is: cbx people ${project.slug}`));
+      return 1;
+    }
+    const label = person.displayName || person.email;
+    if (removing !== undefined) {
+      await removeCollaborator(project.id, person.userId);
+      console.log(green(`${label} is no longer on ${project.name}.`));
+      return 0;
+    }
+    const flag = parsed.flags.get("role");
+    const role = typeof flag === "string" ? flag.trim().toLowerCase() : "";
+    if (!["write", "read", "admin"].includes(role)) {
+      console.error(red(role ? `"${role}" is not a role. Use write, read or admin.` : "Which role? Add --role write, read or admin."));
+      return 1;
+    }
+    await setCollaboratorRole(project.id, person.userId, role);
+    console.log(green(`${label} now has ${role} access to ${project.name}.`));
+    return 0;
+  }
 
   const email = parsed.flags.get("invite");
   if (email === true) {
@@ -222,12 +428,26 @@ export async function commandCollaborators(parsed: Parsed): Promise<number> {
     return 1;
   }
   if (typeof email === "string" && email.trim()) {
-    const role = parsed.flags.get("role");
-    await invite(project.id, {
-      email: email.trim(),
-      role: typeof role === "string" ? role : "member",
-    });
+    /*
+      The service knows three roles. The old default, "member", was not one
+      of them, so every invite without --role was refused.
+    */
+    const flag = parsed.flags.get("role");
+    const role = typeof flag === "string" ? flag.trim().toLowerCase() : "write";
+    if (!["write", "read", "admin"].includes(role)) {
+      console.error(red(`"${role}" is not a role. Use write, read or admin.`));
+      return 1;
+    }
+    const sent = await invite(project.id, { email: email.trim(), role });
     console.log(green(`Invited ${email.trim()} to ${project.name}.`));
+    /*
+      The email can go astray, so the link is handed to the person who sent
+      it too. It only works once someone is signed in as that address.
+    */
+    if (sent.inviteUrl) {
+      console.log(dim("  If the email doesn't arrive, send them this link instead:"));
+      console.log(`  ${sent.inviteUrl}`);
+    }
     return 0;
   }
 
@@ -270,6 +490,26 @@ export async function commandWatch(parsed: Parsed): Promise<number> {
   if (parsed.flags.has("email")) {
     change.emailDigest = parsed.flags.get("email") !== "off";
   }
+  /* Workspace discussions are their own switch (workspace_threads.ts). */
+  const discussions = parsed.flags.get("discussions");
+  if (discussions !== undefined) {
+    if (discussions !== "all" && discussions !== "off") {
+      console.error(red("--discussions must be all or off"));
+      return 1;
+    }
+    await callApi(`/v1/repositories/${encodeURIComponent(project.id)}/workspace-discussions/watch`, {
+      method: "PUT",
+      body: { level: discussions },
+    });
+    console.log(
+      green(
+        discussions === "all"
+          ? `Workspace discussions in ${project.name}: new messages reach your notifications.`
+          : `Workspace discussions in ${project.name}: off. Threads still show unread counts.`,
+      ),
+    );
+    if (!Object.keys(change).length) return 0;
+  }
   if (Object.keys(change).length) {
     await setWatch(project.id, change);
     console.log(green(`Updated what reaches you about ${project.name}.`));
@@ -288,6 +528,9 @@ export async function commandWatch(parsed: Parsed): Promise<number> {
 
 /** The automations a project has, and how they have been going. */
 export async function commandWorkflows(parsed: Parsed): Promise<number> {
+  /* `cbx actions check …` and `cbx actions set …` (actions_command.ts). */
+  if (parsed.positional[0] === "check") return commandCheckWorkflows(parsed);
+  if (parsed.positional[0] === "set") return commandSetWorkflow(parsed);
   const project = await resolveProject(
     typeof parsed.flags.get("project") === "string"
       ? String(parsed.flags.get("project"))
@@ -530,6 +773,26 @@ export async function commandLogs(parsed: Parsed): Promise<number> {
     return 1;
   }
 
+  /*
+    --follow: keep printing as the runner sends, until the run ends. A build
+    that takes ten minutes shows its progress rather than nothing.
+  */
+  if (parsed.flags.has("follow")) {
+    console.log(`${accent(`#${run.number}`)} ${bold(run.workflow)} — following until it ends`);
+    let shown = 0;
+    let state = run;
+    for (;;) {
+      const lines = await runLogs(project.id, run.id);
+      for (const line of lines.slice(shown)) console.log(line.stream === "stderr" ? red(line.line) : line.line);
+      shown = Math.max(shown, lines.length);
+      if (state.status !== "queued" && state.status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      state = (await runs(project.id)).find((one) => one.id === run.id) ?? state;
+    }
+    console.log(`${statusText(state.status)}${state.summary ? ` · ${dim(state.summary)}` : ""}`);
+    return state.status === "failed" ? 1 : 0;
+  }
+
   const lines = await runLogs(project.id, run.id);
   console.log(
     `${accent(`#${run.number}`)} ${bold(run.workflow)} — ${statusText(run.status)}` +
@@ -554,6 +817,55 @@ export async function commandLogs(parsed: Parsed): Promise<number> {
     console.log(line.stream === "stderr" ? red(line.line) : line.line);
   }
   return run.status === "failed" ? 1 : 0;
+}
+
+/** Stop a run that is waiting or working, by the number people say. */
+export async function commandCancel(parsed: Parsed): Promise<number> {
+  const asked = parsed.positional[0];
+  const number = Number((asked ?? "").replace(/^#/, ""));
+  if (!asked || !Number.isInteger(number) || number < 1) {
+    console.error(red("Which run? Try: cbx cancel 12"));
+    return 1;
+  }
+  const project = await resolveProject(parsed.positional[1]);
+  if (!project) return 1;
+  const run = (await runs(project.id)).find((one) => one.number === number);
+  if (!run) {
+    console.error(red(`${project.name} has no run #${number}.`));
+    return 1;
+  }
+  if (run.status !== "queued" && run.status !== "running") {
+    console.error(red(`#${number} has already finished (${run.status}).`));
+    return 1;
+  }
+  await cancelRun(project.id, run.id);
+  console.log(`${accent(`#${number}`)} cancelled. A runner working on it stops at its next heartbeat.`);
+  return 0;
+}
+
+/** Run a finished run again, against the same save. */
+export async function commandRerun(parsed: Parsed): Promise<number> {
+  const asked = parsed.positional[0];
+  const number = Number((asked ?? "").replace(/^#/, ""));
+  if (!asked || !Number.isInteger(number) || number < 1) {
+    console.error(red("Which run? Try: cbx rerun 12"));
+    return 1;
+  }
+  const project = await resolveProject(parsed.positional[1]);
+  if (!project) return 1;
+  const run = (await runs(project.id)).find((one) => one.number === number);
+  if (!run) {
+    console.error(red(`${project.name} has no run #${number}.`));
+    return 1;
+  }
+  if (run.status === "queued" || run.status === "running") {
+    console.error(red(`#${number} is still going. Cancel it first with cbx cancel ${number}.`));
+    return 1;
+  }
+  const queued = await rerunRun(project.id, run.id);
+  console.log(`${accent(`#${queued.number}`)} queued: #${number} again, against the same save.`);
+  console.log(dim(`Follow it with: cbx logs ${queued.number} --follow`));
+  return 0;
 }
 
 /** The tokens that can act as this account. */
@@ -594,7 +906,8 @@ export async function commandDelete(parsed: Parsed): Promise<number> {
 
   if (parsed.flags.get("yes") !== true) {
     console.log(
-      `This deletes ${bold(project.name)} — ${project.versionCount} versions, ` +
+      `This deletes ${bold(project.name)} — ${project.versionCount} ` +
+        `${project.versionCount === 1 ? "version" : "versions"}, ` +
         `${bytes(project.storedBytes)}.`,
     );
     console.log(dim("It is kept for 30 days before the storage is reclaimed."));
@@ -677,6 +990,83 @@ export async function commandHooks(parsed: Parsed): Promise<number> {
     return 0;
   }
 
+  /*
+    Everything else the website's Webhooks card does to one hook: send a test,
+    read what was delivered, send one again, change its events, switch it back
+    on. Each names the hook by id or address, as --remove does.
+  */
+  const tested = parsed.flags.get("test");
+  const history = parsed.flags.get("deliveries");
+  const resend = parsed.flags.get("redeliver");
+  const resume = parsed.flags.get("on");
+  const named = parsed.flags.get("hook");
+  const changingEvents = parsed.flags.has("events");
+  if (tested !== undefined || history !== undefined || resend !== undefined || resume !== undefined || changingEvents) {
+    const wanted = [tested, history, resume, named].find((value) => typeof value === "string" && value.trim());
+    const hook = await whichHook(project.id, project.name, typeof wanted === "string" ? wanted.trim() : null);
+    if (!hook) return 1;
+
+    if (tested !== undefined) {
+      const delivery = await testWebhook(project.id, hook.id);
+      console.log(`Sent a test to ${hook.url}.`);
+      console.log(`  ${deliveryLine(delivery)}`);
+      return delivery.state === "delivered" ? 0 : 1;
+    }
+
+    if (history !== undefined) {
+      const found = await webhookDeliveries(project.id, hook.id);
+      if (!found.length) {
+        console.log(dim(`Nothing has been sent to ${hook.url} yet. Send a test: cbx hooks --test ${hook.id}`));
+        return 0;
+      }
+      console.log(bold(hook.url));
+      for (const delivery of found) console.log(`  ${deliveryLine(delivery)}`);
+      console.log("");
+      console.log(dim(`  Send one again: cbx hooks --redeliver <delivery> --hook ${hook.id}`));
+      return 0;
+    }
+
+    if (resend !== undefined) {
+      if (typeof resend !== "string" || !resend.trim()) {
+        console.error(red("Which delivery?") + dim(`  cbx hooks --deliveries ${hook.id} lists them`));
+        return 1;
+      }
+      /* The start of an id is enough, as long as it picks out one. */
+      const prefix = resend.trim().toLowerCase();
+      const matches = (await webhookDeliveries(project.id, hook.id)).filter((one) => one.id.toLowerCase().startsWith(prefix));
+      if (matches.length !== 1) {
+        console.error(
+          red(matches.length ? `${resend.trim()} matches more than one delivery; give more of its id.` : `No recent delivery ${resend.trim()} for ${hook.url}.`),
+        );
+        return 1;
+      }
+      const delivery = await redeliverWebhook(project.id, hook.id, matches[0]!.id);
+      console.log(`Sent ${matches[0]!.event} to ${hook.url} again.`);
+      console.log(`  ${deliveryLine(delivery)}`);
+      return delivery.state === "delivered" ? 0 : 1;
+    }
+
+    if (changingEvents) {
+      const value = parsed.flags.get("events");
+      const text = typeof value === "string" ? value.trim() : "";
+      const events = text === "all" ? [] : text.split(",").map((one) => one.trim()).filter(Boolean);
+      if (!events.length && text !== "all") {
+        console.error(red("Which events? A comma separated list, or all.") + dim("  cbx hooks --hook <id> --events version.published"));
+        return 1;
+      }
+      await updateWebhook(project.id, hook.id, { events });
+    }
+    if (resume !== undefined) {
+      await updateWebhook(project.id, hook.id, { active: true });
+    }
+    const after = (await webhooks(project.id)).find((one) => one.id === hook.id) ?? hook;
+    console.log(green(`Updated ${hook.url}.`));
+    console.log(
+      `  ${after.active ? green("on") : red("off")}  ${dim(after.events.length ? after.events.join(", ") : "everything")}`,
+    );
+    return 0;
+  }
+
   const removing = parsed.flags.get("remove");
   if (removing !== undefined) {
     if (typeof removing !== "string" || !removing.trim()) {
@@ -722,5 +1112,42 @@ export async function commandHooks(parsed: Parsed): Promise<number> {
         (hook.events.length ? `  ${dim(hook.events.join(", "))}` : `  ${dim("everything")}`),
     );
   }
+  if (found.some((hook) => !hook.active)) {
+    console.log("");
+    console.log(dim("  Switch one back on: cbx hooks --on <id>"));
+  }
   return 0;
+}
+
+/**
+ * The hook a command is about: named by id or address, or the only one.
+ *
+ * Naming none is fine when there is exactly one, which is the usual case and
+ * the one where asking "which?" would be a question with one answer.
+ */
+async function whichHook(projectId: string, projectName: string, wanted: string | null): Promise<Webhook | null> {
+  const found = await webhooks(projectId);
+  if (!wanted) {
+    if (found.length === 1) return found[0]!;
+    console.error(
+      red(found.length ? `${projectName} has ${found.length} webhooks. Say which: --hook <id>` : `${projectName} notifies nothing.`),
+    );
+    return null;
+  }
+  const hook = found.find((one) => one.id === wanted || one.url === wanted);
+  if (!hook) console.error(red(`${projectName} has no webhook called ${wanted}.`));
+  return hook ?? null;
+}
+
+/** One delivery on one line: when, what, how it went, and its id. */
+function deliveryLine(delivery: WebhookDelivery): string {
+  const when = new Date(delivery.createdAt).toLocaleString();
+  const how =
+    delivery.state === "delivered"
+      ? green(`delivered${delivery.status ? ` (${delivery.status})` : ""}`)
+      : delivery.state === "pending"
+        ? dim(`waiting, ${delivery.attempts} ${delivery.attempts === 1 ? "try" : "tries"} so far`)
+        : red(`${delivery.state}${delivery.status ? ` (${delivery.status})` : ""}`);
+  const detail = delivery.detail && delivery.state !== "delivered" ? dim(`  ${delivery.detail}`) : "";
+  return `${dim(delivery.id.slice(0, 8))}  ${when.padEnd(22)} ${delivery.event.padEnd(24)} ${how}${detail}`;
 }

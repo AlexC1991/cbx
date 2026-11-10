@@ -25,12 +25,8 @@ import { split } from "./version_commands.js";
 import { versions } from "./api.js";
 
 import type { Parsed } from "./registry.js";
+import { accent, bold, dim, green, red } from "./colour.js";
 
-const dim = (value: string) => `[2m${value}[0m`;
-const bold = (value: string) => `[1m${value}[0m`;
-const red = (value: string) => `[31m${value}[0m`;
-const green = (value: string) => `[32m${value}[0m`;
-const accent = (value: string) => `[33m${value}[0m`;
 
 /** What the service will take in one request. */
 const DIRECT_LIMIT = 95 * 1024 * 1024;

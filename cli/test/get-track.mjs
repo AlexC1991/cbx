@@ -32,13 +32,13 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-import { assertSafeTarget, autoClean, scratchRoot } from "./live.mjs";
+import { assertSafeTarget, autoClean, liveToken, scratchRoot } from "./live.mjs";
 
 assertSafeTarget();
 const root = path.resolve(scratchRoot("suite-track"));
 mkdirSync(root, { recursive: true });
-const token = readFileSync(
-  path.join(process.env.APPDATA, "CodeRook", "token"), "utf8").trim();
+/* The token the run is handed (CODEROOK_TOKEN) first, like every other suite. */
+const token = liveToken();
 const entry = path.resolve(import.meta.dirname, "../dist/cli/src/cli.js");
 const home = path.join(root, "home");
 mkdirSync(home, { recursive: true });

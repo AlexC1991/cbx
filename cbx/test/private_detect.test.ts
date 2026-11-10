@@ -104,6 +104,29 @@ test("leaves the actual project alone", async (t) => {
   );
 });
 
+test("a source folder called cache is source; a browser's Cache is not", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "coderook-cache-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = async (relative: string) => {
+    const full = path.join(root, ...relative.split("/"));
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, "x");
+  };
+  // FreeType, as a Godot checkout carries it.
+  await file("thirdparty/freetype/src/cache/ftcache.c");
+  await file("thirdparty/freetype/src/cache/ftccache.h");
+  // A Chromium profile's caches.
+  await file("profile/Cache/Cache_Data/index");
+  await file("profile/GPUCache/index");
+  await file("profile/GPUCache/data_0");
+  await file("profile/Code Cache/js/index");
+  await file("profile/Code Cache/wasm/index");
+
+  const paths = (await detectPrivateDirectories(root)).map((entry) => entry.path).sort();
+  assert.ok(!paths.some((p) => p.startsWith("thirdparty")), "FreeType's cache folder is left alone");
+  assert.deepEqual(paths, ["profile/Cache", "profile/Code Cache", "profile/GPUCache"]);
+});
+
 test("finds credentials a tool wrote, not just hand-written .env files", async (t) => {
   const root = await fixture();
   t.after(() => rm(root, { recursive: true, force: true }));
